@@ -40,7 +40,7 @@ describe("refactor tools", () => {
     expect(names()).toEqual(expect.arrayContaining(["rename_symbol", "find_references", "find_definition"]));
   });
 
-  it("renames code identifiers across files, leaving strings and comments, and reports them", async () => {
+  it("renames code identifiers across files and in their comments, leaving strings, and reports them", async () => {
     const { ctx, read } = workspace(FILES);
     const args = { symbol: "calcTotal", new_name: "computeTotal" };
     expect(await tool("rename_symbol").check!(args, ctx)).toBeUndefined();
@@ -48,12 +48,22 @@ describe("refactor tools", () => {
     expect(r.ok).toBe(true);
     expect(r.changed?.sort()).toEqual(["src/cart.js", "src/total.js"]);
     expect(read("src/total.js")).toContain("function computeTotal(items)");
+    expect(read("src/total.js")).toContain("// computeTotal sums prices"); // a code-like name in a comment is the symbol
     expect(read("src/total.js")).toContain("module.exports = { computeTotal };");
     expect(read("src/cart.js")).toContain("const { computeTotal } = require");
     expect(read("src/cart.js")).toContain("computeTotal(c.items)");
     expect(read("src/cart.js")).toContain("'calcTotal'"); // string untouched
+    expect(r.output).toContain("Comments that named it were updated too (1)");
     expect(r.output).toContain("src/cart.js:2");
     expect(r.output).toContain("README.md:1");
+  });
+
+  it("leaves comments alone when the name is a plain word", async () => {
+    const { ctx, read } = workspace({ "shop.go": "package shop\n\n// Basket holds the items of one Basket order.\ntype Basket struct{ n int }\n\nfunc New() Basket { return Basket{} }\n" });
+    const r = await tool("rename_symbol").run({ symbol: "Basket", new_name: "Cart" }, ctx);
+    expect(r.ok).toBe(true);
+    expect(read("shop.go")).toContain("// Basket holds the items of one Basket order.\ntype Cart struct");
+    expect(read("shop.go")).toContain("func New() Cart { return Cart{} }");
   });
 
   it("refuses a rename onto a name that is already used", async () => {

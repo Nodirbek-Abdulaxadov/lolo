@@ -18,7 +18,7 @@ const JS_EXT = [".js", ".ts", ".tsx", ".jsx", ".mjs", ".cjs", ".mts", ".cts"];
 const JS_SPEC = /(\brequire\s*\(\s*|\bimport\s*\(\s*|\bfrom\s+|^\s*import\s+)(['"])(\.{1,2}\/[^'"\n]*)\2/gm;
 
 /** What a relative specifier in `importer` points to, as a workspace path, if it is one of `candidates`. */
-function resolveSpec(importer: string, spec: string, exists: (p: string) => boolean): string | undefined {
+export function resolveSpec(importer: string, spec: string, exists: (p: string) => boolean): string | undefined {
   const base = path.posix.normalize(path.posix.join(path.posix.dirname(importer), spec));
   for (const p of [base, ...JS_EXT.map((e) => base + e), ...JS_EXT.map((e) => `${base}/index${e}`)]) if (exists(p)) return p;
   return undefined;

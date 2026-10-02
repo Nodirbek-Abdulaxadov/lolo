@@ -70,7 +70,7 @@ export interface ToolResult {
 export type ToolKind = "read" | "write" | "exec" | "control";
 
 /** Tools that are offered only for todos that need them; every tool in the schema is another chance for a small model to pick wrong. */
-export type ToolGroup = "git" | "fileops" | "symbols" | "refactor" | "process" | "web" | "mcp" | "memory" | "explore";
+export type ToolGroup = "git" | "fileops" | "symbols" | "refactor" | "process" | "web" | "mcp" | "memory" | "explore" | "diagnostics";
 
 export interface ToolDef<A = any> {
   name: string;

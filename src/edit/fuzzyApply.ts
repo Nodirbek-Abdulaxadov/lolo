@@ -20,6 +20,8 @@ export type ApplyResult =
       closest?: { startLine: number; text: string; score: number };
       /** 1-based start lines when `search` matched more than one place (pass one back as `at`). */
       matches?: number[];
+      /** The change is already in the file: nothing to apply (a no-op, not a failed match). */
+      alreadyApplied?: boolean;
     };
 
 /**
@@ -58,7 +60,7 @@ export function fuzzyApply(content: string, search: string, replace: string, opt
     const lead = replaced.indexOf(search);
     for (let i = first; i >= 0; i = text.indexOf(search, i + 1)) {
       if (i >= lead && text.startsWith(replaced, i - lead)) {
-        return { ok: false, reason: "The file already contains `replace` at that place: this change is already applied. Re-read the file before editing again." };
+        return { ok: false, alreadyApplied: true, reason: "The file already contains `replace` at that place: this change is already applied. Re-read the file before editing again." };
       }
     }
   }
@@ -81,7 +83,9 @@ export function fuzzyApply(content: string, search: string, replace: string, opt
   // earlier. Fuzzy-matching it would hit the already-edited lines.
   const replaceTrimmed = trimBlankEdges(replace);
   if (replaceTrimmed.trim() && (text.includes(replaceTrimmed) || normalizeWs(text).includes(normalizeWs(replaceTrimmed)))) {
-    return { ok: false, reason: "The file already contains `replace` and not `search`: this change is already applied. Re-read the file before editing again." };
+    // A short `replace` (`return x;`) may just occur elsewhere: that says little about this change.
+    const alreadyApplied = replaceTrimmed.replace(/\s/g, "").length >= 25;
+    return { ok: false, alreadyApplied, reason: "The file already contains `replace` and not `search`: this change is already applied. Re-read the file before editing again." };
   }
 
   const lines = text.split("\n");
@@ -164,6 +168,70 @@ export function overlapCandidates(original: string, applied: string, startLine: 
   if (tail) out.push(build(0, tail));
   if (head) out.push(build(head, 0));
   return out;
+}
+
+/** `target = value` (also `self.x`, `this.x`); not `==`, `+=`, declarations. */
+const ASSIGNS = /^\s*((?:self\.|this\.)?[A-Za-z_$][\w$.]*)\s*(?::\s*[^=]+)?=(?!=)/;
+
+/**
+ * `replace` ends by re-typing the lines that follow `search`, some changed: `search` was a function's
+ * first line and `replace` that line plus its body with one assignment changed. Applied as is, the
+ * old lines stay below the new ones (valid code in Python, where the old `self.tags = tags` then
+ * overrides the new one). Given the file before and after an applied edit, returns the version where
+ * those old lines are replaced: at least two lines, each identical or filling the same slot (the same
+ * assignment target, or both `return`), at least one identical.
+ */
+export function retypedTail(original: string, applied: string, startLine: number, searchLines: number): string | undefined {
+  const eol = detectEol(original);
+  const orig = toLf(original).split("\n");
+  const next = toLf(applied).split("\n");
+  const s = startLine - 1;
+  const m = next.length - orig.length + searchLines;
+  const repl = next.slice(s, s + m);
+  const after = orig.slice(s + searchLines);
+  // The slot a line fills: what it assigns to, or the function's `return`.
+  const target = (l: string) => ASSIGNS.exec(l)?.[1] ?? (/^\s*return\b/.test(l) ? "return" : undefined);
+  for (let k = Math.min(m - 1, after.length); k >= 2; k--) {
+    const tail = repl.slice(-k);
+    const old = after.slice(0, k);
+    let identical = 0;
+    const fits = tail.every((l, i) => {
+      if (normalizeWs(l) === normalizeWs(old[i])) return l.trim() ? ++identical > 0 : true;
+      return !!target(l) && target(l) === target(old[i]);
+    });
+    if (fits && identical > 0 && identical < k) return fromLf([...orig.slice(0, s), ...repl, ...after.slice(k)].join("\n"), eol);
+  }
+  return undefined;
+}
+
+/**
+ * `search` is only the first line(s) of a block (`test("adds", () => {`, `if (x) {`) and `replace` a
+ * complete block: the old block, then a new one after it, or a new version of it. Applied as is, the
+ * old block's body stays behind with an extra `});`. Returns the file with the replacement covering
+ * the whole old block, up to where the brackets `search` opens close again; lines right after the
+ * block that `replace` repeats at its end are not duplicated. The caller keeps it only if it parses.
+ */
+export function blockCandidates(original: string, startLine: number, search: string, replace: string, imbalance: (text: string) => unknown): string[] {
+  const eol = detectEol(original);
+  const lines = toLf(original).split("\n");
+  const s = startLine - 1;
+  const searchLines = trimBlankEdges(toLf(search)).split("\n");
+  const repl = trimBlankEdges(toLf(replace));
+  if (s < 0 || !imbalance(searchLines.join("\n")) || imbalance(repl)) return [];
+  const last = Math.min(lines.length, s + 400);
+  for (let k = s + searchLines.length; k < last; k++) {
+    if (imbalance(lines.slice(s, k + 1).join("\n"))) continue;
+    const replLines = repl.split("\n");
+    const after = lines.slice(k + 1);
+    let repeated = 0;
+    for (let n = Math.min(replLines.length - 1, after.length); n > 0 && !repeated; n--) {
+      const tail = replLines.slice(-n);
+      if (tail.some((l) => l.trim()) && tail.every((l, i) => normalizeWs(l) === normalizeWs(after[i]))) repeated = n;
+    }
+    const body = reindent(repl, searchLines, lines.slice(s, s + searchLines.length));
+    return [fromLf([...lines.slice(0, s), ...body.slice(0, body.length - repeated), ...after].join("\n"), eol)];
+  }
+  return [];
 }
 
 function splice(

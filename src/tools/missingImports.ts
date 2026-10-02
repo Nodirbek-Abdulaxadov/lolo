@@ -15,6 +15,9 @@ add("System.Text.Json", "JsonSerializer JsonSerializerOptions JsonDocument JsonE
 add("System.Text.Json.Serialization", "JsonPropertyName JsonIgnore JsonConverter JsonStringEnumConverter");
 add("System.Globalization", "CultureInfo NumberStyles DateTimeStyles");
 add("System.Diagnostics", "Stopwatch Debug Process Trace");
+// Nullability attributes models add to Equals/TryGet overrides after a CS8765 warning.
+add("System.Diagnostics.CodeAnalysis", "NotNullWhen NotNullWhenAttribute MaybeNullWhen MaybeNullWhenAttribute NotNull MaybeNull AllowNull DisallowNull MemberNotNull MemberNotNullWhen DoesNotReturn SetsRequiredMembers ExcludeFromCodeCoverage");
+add("System.Runtime.CompilerServices", "CallerMemberName CallerFilePath CallerLineNumber");
 add("System.Collections.Concurrent", "ConcurrentDictionary ConcurrentQueue ConcurrentBag ConcurrentStack BlockingCollection");
 add("System.Collections.Immutable", "ImmutableArray ImmutableList ImmutableDictionary ImmutableHashSet");
 add("System.Collections.ObjectModel", "ObservableCollection ReadOnlyCollection ReadOnlyDictionary Collection");
@@ -63,16 +66,57 @@ export function addUsing(content: string, ns: string): string {
   return bom + lines.join(eol);
 }
 
+const CS_NAMESPACE = /^\s*namespace\s+([\w.]+)\s*[;{]?/m;
+const CS_TYPE = /\b(?:class|interface|record|struct|enum)\s+([A-Za-z_]\w*)/g;
+
+/** Types the project's own C# files declare → their namespace (files without a namespace are left out). */
+export async function projectTypes(files: string[], read: (path: string) => Promise<string>): Promise<Map<string, string>> {
+  const types = new Map<string, string>();
+  for (const f of files.filter((f) => /\.cs$/i.test(f) && !/(^|\/)(bin|obj)\//.test(f)).slice(0, 300)) {
+    const text = await read(f).catch(() => "");
+    const ns = CS_NAMESPACE.exec(text)?.[1];
+    if (ns) for (const m of text.matchAll(CS_TYPE)) if (!types.has(m[1])) types.set(m[1], ns);
+  }
+  return types;
+}
+
+/** Namespace names models write when they don't know the project's: `YourNamespace`, `MyNamespace`, `Example`. */
+const PLACEHOLDER_NAMESPACE = /^(Your\w*|My(Namespace|Project|Company)\w*|Namespace\d*|Example\w*|Sample\w*)$/;
+
+/**
+ * A new C# file in a placeholder namespace (`namespace YourNamespace`) that no other file uses, in a
+ * project whose files share one namespace: the file with the project's namespace instead (else
+ * undefined). Otherwise its types are invisible to the rest of the project (CS0246).
+ */
+export function placeholderNamespaceFix(content: string, otherFiles: string[]): { content: string; from: string; to: string } | undefined {
+  const m = CS_NAMESPACE.exec(content);
+  if (!m || !PLACEHOLDER_NAMESPACE.test(m[1])) return undefined;
+  const used = new Set(otherFiles.map((t) => CS_NAMESPACE.exec(t)?.[1]).filter((n): n is string => !!n));
+  if (used.size !== 1 || used.has(m[1])) return undefined;
+  const to = [...used][0];
+  return { content: content.slice(0, m.index) + m[0].replace(m[1], to) + content.slice(m.index + m[0].length), from: m[1], to };
+}
+
 /**
  * Fixes for C# build output: the missing using directives per file, as new file contents,
- * and a note for the model. Empty when the output has none of the known types.
+ * and a note for the model. Empty when the output has none of the known types. `types` lists
+ * the project's own types (loaded only when a name isn't a well-known framework type): a type
+ * declared in another namespace of the project gets its `using` like an IDE quick fix.
  */
-export async function missingUsings(output: string, root: string, read: (path: string) => Promise<string>): Promise<{ changes: FileChange[]; note: string }> {
+export async function missingUsings(
+  output: string,
+  root: string,
+  read: (path: string) => Promise<string>,
+  types?: () => Promise<Map<string, string>>,
+): Promise<{ changes: FileChange[]; note: string }> {
   const wanted = new Map<string, Set<string>>();
+  let project: Map<string, string> | undefined;
   for (const m of output.matchAll(CS_ERROR)) {
-    const ns = CS_NAMESPACES[m[2]];
     const file = workspacePath(m[1].trim(), root);
-    if (!ns || !file) continue;
+    if (!file) continue;
+    let ns = CS_NAMESPACES[m[2]];
+    if (!ns && types) ns = (project ??= await types()).get(m[2]) as string;
+    if (!ns) continue;
     wanted.set(file, (wanted.get(file) ?? new Set()).add(ns));
   }
   const changes: FileChange[] = [];

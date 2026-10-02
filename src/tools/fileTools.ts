@@ -1,11 +1,16 @@
 import { listFiles } from "../context/repoMap";
-import { fileSymbols, languageFor } from "../context/treeSitter";
+import { codeWithoutComments, fileSymbols, languageFor } from "../context/treeSitter";
 import { restoreCopiedEscapes } from "../edit/escapes";
-import { applyLineRange, editToolFor, EditTool, isLazyPlaceholder, isStub, mergeLazyRewrite } from "../edit/formats";
-import { fuzzyApply, overlapCandidates, reindent } from "../edit/fuzzyApply";
-import { checkEditSyntax, findImbalance, syntaxRepairs } from "../edit/syntaxGuard";
+import { applyLineRange, editToolFor, EditState, EditTool, isLazyPlaceholder, isStub, mergeLazyRewrite, widenForReassignment } from "../edit/formats";
+import { blockCandidates, fuzzyApply, overlapCandidates, reindent, retypedTail } from "../edit/fuzzyApply";
+import { jsRuntimeProblem } from "../edit/jsChecks";
+import { pyRuntimeProblem } from "../edit/pyChecks";
+import { checkEditSyntax, findImbalance, fixCSharpEscapes, syntaxRepairs } from "../edit/syntaxGuard";
 import { collapseBlankRuns, detectEol, fromLf, maxBlankRun, numberLines, toLf } from "../edit/text";
-import { moduleSystemMismatch, moduleSystemProblem, toCommonJs, undefinedExports } from "./moduleSystem";
+import { unusedImportNote } from "../edit/unusedImports";
+import { exportShapeProblem, moduleSystemMismatch, moduleSystemProblem, toCommonJs, undefinedExports } from "./moduleSystem";
+import { committedVersion } from "./gitTools";
+import { placeholderNamespaceFix } from "./missingImports";
 import { IGNORED_DIRS } from "./paths";
 import { symbolSummary } from "./output";
 import { fail, ok, ToolContext, ToolDef, ToolResult } from "./types";
@@ -316,26 +321,40 @@ async function enclosingDefs(path: string, text: string, lines: number[]): Promi
 }
 
 /**
- * `search` is the first line(s) of a function or class and `replace` a complete new version of
- * it (balanced brackets, same name): the model means to replace the whole definition. Applied
+ * `search` ends with the first line(s) of a function or class (possibly after a few lines before
+ * it: `let nextId = 1;` + `function createUser(...) {`) and `replace` holds a complete new version
+ * of it (balanced brackets, same name): the model means to replace the whole definition. Applied
  * literally, the old body would stay behind as a dead `{ ... }` block, which still parses in JS.
- * Returns the file with the whole definition replaced, when that parses; brace languages only.
+ * Returns the file with everything from `search` to the definition's end replaced, when that
+ * parses; lines after the definition that `replace` repeats at its end are not duplicated.
+ * Brace languages only.
  */
 async function redefinition(path: string, original: string, search: string, replace: string, startLine: number) {
   if (!BRACE_FILE.test(path)) return undefined;
   const lines = toLf(original).split("\n");
-  const def = ((await fileSymbols(path, original))?.defs ?? []).find((d) => d.line === startLine && d.endLine > d.line);
   const s = toLf(search).replace(/^(?:[ \t]*\n)+|(?:\n[ \t]*)+$/g, "");
   const r = toLf(replace).replace(/^(?:[ \t]*\n)+|(?:\n[ \t]*)+$/g, "");
-  if (!def || s.split("\n").length >= def.endLine - def.line + 1) return undefined; // search already spans it
+  const searchEnd = startLine + s.split("\n").length - 1;
+  // A definition that starts inside `search` and goes on after it (else `search` already spans it).
+  const def = ((await fileSymbols(path, original))?.defs ?? []).find((d) => d.line >= startLine && d.line <= searchEnd && d.endLine > searchEnd);
+  if (!def) return undefined;
   const rLines = r.split("\n");
   const nameRe = new RegExp(`(?<![\\w$])${def.name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![\\w$])`);
-  if (!nameRe.test(rLines[0]) || !r.includes("{") || findImbalance(r)) return undefined;
-  const body = reindent(r, [rLines[0]], [lines[def.line - 1]]);
-  const content = fromLf([...lines.slice(0, def.line - 1), ...body, ...lines.slice(def.endLine)].join("\n"), detectEol(original));
+  const header = rLines.findIndex((l) => nameRe.test(l));
+  if (header < 0 || header > def.line - startLine + 2 || !r.includes("{") || findImbalance(r)) return undefined;
+  const body = reindent(r, [rLines[header]], [lines[def.line - 1]]);
+  const after = lines.slice(def.endLine);
+  const same = (a: string[], b: string[]) => a.length === b.length && a.every((l, i) => l.trim() === b[i].trim()) && a.some((l) => l.trim());
+  let repeated = 0;
+  for (let k = Math.min(rLines.length - header - 1, after.length); k > 0 && !repeated; k--) if (same(rLines.slice(-k), after.slice(0, k))) repeated = k;
+  const content = fromLf([...lines.slice(0, startLine - 1), ...body, ...after.slice(repeated)].join("\n"), detectEol(original));
   if (await checkEditSyntax(path, original, content)) return undefined;
   return { content, name: def.name, from: def.line, to: def.endLine };
 }
+
+const RETYPED_NOTE = " (the end of your new text re-typed the lines after the ones you replaced, some changed; the old ones were replaced, not left below)";
+const OVERLAP_NOTE = " (your new text repeated the lines next to the ones you replaced; they were replaced, not duplicated)";
+const BLOCK_NOTE = " (you replaced only the first line of a block with a complete block, so it replaced the whole old block)";
 
 const BRACE_FILE = /\.(ts|tsx|js|jsx|mjs|cjs|cs|java|kt|go|rs|c|h|cpp|hpp|cc|swift|php|dart|scala)$/i;
 
@@ -349,6 +368,39 @@ async function knownLines(ctx: ToolContext, before?: string): Promise<string[]> 
 
 const ESCAPES_RESTORED = " (regex escapes such as \\s that came out as line breaks were restored from the code you read; in JSON write them as \\\\s)";
 
+/** The user asks to keep part of what is there ("fix the mistake but keep the rounding I added"). */
+const KEEPS = /\b(keep(s|ing)?|preserv\w*|retain\w*)\b|\b(don'?t|do not|without)\s+(los\w*|remov\w*|drop\w*|undo\w*|revert\w*)\b/i;
+
+/**
+ * "My uncommitted change broke it; fix it but keep X": small models restore the committed file,
+ * which passes the tests and throws away what the user asked to keep. Advice when `content` is the
+ * committed version of a file that has uncommitted changes (comments and blank lines aside).
+ */
+async function undoesKeptChange(ctx: ToolContext, path: string, before: string, content: string): Promise<string | undefined> {
+  const keep = KEEPS.exec(ctx.message ?? "");
+  if (!keep) return undefined;
+  const head = await committedVersion(path, ctx);
+  const code = (t: string) => toLf(t).split("\n").map((l) => l.trim()).filter((l) => l && !/^(\/\/|#|\/\*|\*)/.test(l)).join("\n");
+  if (head === undefined || code(head) === code(before) || code(head) !== code(content)) return undefined;
+  const asked = ctx.message!.slice(Math.max(0, keep.index - 30), keep.index + 70).replace(/\s+/g, " ").trim();
+  return (
+    `This would restore the committed version of ${path} and undo all of the user's uncommitted change to it, but they asked to keep part of it ("…${asked}…"). ` +
+    `Keep what they asked for and fix only the mistake in their change. The file was NOT changed.`
+  );
+}
+
+/** Contents refused by a runtime check, per run. */
+const runtimeRefused = new WeakMap<EditState, Set<string>>();
+/** Whether the model proposes content a runtime check refused before: it insists, and the check may be wrong. */
+function insists(ctx: ToolContext, path: string, content: string): boolean {
+  const refused = runtimeRefused.get(ctx.edits) ?? new Set<string>();
+  runtimeRefused.set(ctx.edits, refused);
+  const key = `${path}\n${content}`;
+  if (refused.has(key)) return true;
+  refused.add(key);
+  return false;
+}
+
 async function write(ctx: ToolContext, path: string, content: string, isNew: boolean, reason: string, note = "", fragment = content): Promise<ToolResult> {
   const before = isNew ? undefined : await ctx.host.readFile(path);
   const restored = restoreCopiedEscapes(content, await knownLines(ctx, before));
@@ -356,12 +408,35 @@ async function write(ctx: ToolContext, path: string, content: string, isNew: boo
     content = restored.text;
     note += ESCAPES_RESTORED;
   }
+  const csEscapes = await fixCSharpEscapes(path, content);
+  if (csEscapes.fixed) {
+    content = csEscapes.text;
+    note += " (regex escapes such as \\s in normal C# strings were written as \\\\s: C# accepts only \\n, \\t, \\\\ and the like there)";
+  }
+  if (isNew && /\.cs$/i.test(path)) {
+    const others = (await listFiles(ctx.host)).filter((f) => /\.cs$/i.test(f) && f !== path && !/(^|\/)(bin|obj)\//.test(f)).slice(0, 50);
+    const ns = placeholderNamespaceFix(content, await Promise.all(others.map((f) => ctx.host.readFile(f).catch(() => ""))));
+    if (ns) {
+      content = ns.content;
+      note += ` (\`namespace ${ns.from}\` is a placeholder; the project's code is in \`${ns.to}\`, so the file uses that)`;
+    }
+  }
   if (before !== undefined) content = matchFileEnding(before, content);
   if (content === before) {
     return {
       ...fail(`No change: ${path} already has exactly this content. If the current todo is complete, call done now; otherwise do the next step.`, `${reason}: no change`),
       noop: true,
     };
+  }
+  // Only comments changed ("// Ensure this matches the expected output" after a failing test): nothing the code does changed.
+  if (before !== undefined && !/\b(comments?|doc\w*|jsdoc|docstrings?|annotat\w*|explain\w*|todo)\b/i.test(`${ctx.todo ?? ""} ${ctx.message ?? ""}`)) {
+    const was = await codeWithoutComments(path, before);
+    if (was !== undefined && was === (await codeWithoutComments(path, content))) {
+      return {
+        ...fail(`That change only touches comments: ${path} does exactly what it did before. If a check fails, the code itself must change; if the todo is complete, call done.`, `${reason}: comments only`),
+        noop: true,
+      };
+    }
   }
   const pkg = before !== undefined ? handAddedPackage(path, before, content) : undefined;
   if (pkg) return fail(pkg, `${reason}: rejected (package added by hand)`);
@@ -381,6 +456,14 @@ async function write(ctx: ToolContext, path: string, content: string, isNew: boo
     content = repaired.text;
     note += ` (${repaired.note})`;
   }
+  // Mistakes that parse but throw once the code runs, often where the tests don't look.
+  const runtime =
+    (await jsRuntimeProblem(path, before, content)) ??
+    (await pyRuntimeProblem(path, before, content)) ??
+    (before !== undefined ? await exportShapeProblem(path, before, content, ctx) : undefined);
+  if (runtime && !insists(ctx, path, content)) return fail(runtime, `${reason}: rejected (would fail at runtime)`);
+  const undone = before !== undefined ? await undoesKeptChange(ctx, path, before, content) : undefined;
+  if (undone && !insists(ctx, path, content)) return fail(undone, `${reason}: rejected (undoes what the user asked to keep)`);
   const outcome = await ctx.host.proposeWrite(path, content, { isNew, reason });
   if (!outcome.applied) {
     const said = outcome.note ? ` They said: ${outcome.note}` : "";
@@ -390,6 +473,7 @@ async function write(ctx: ToolContext, path: string, content: string, isNew: boo
   if (outcome.note) {
     return ok(`${isNew ? "Created" : "Edited"} ${path}, but ${outcome.note}, so the file differs from your proposal. Re-read it before editing again.`, `${reason}: partly applied (${outcome.note})`, [path]);
   }
+  note += unusedImportNote(path, before, content);
   return ok(`${isNew ? "Created" : "Edited"} ${path}.${note}`, `${reason}: applied`, [path]);
 }
 
@@ -413,8 +497,13 @@ export const editFile: ToolDef<{ path: string; search: string; replace: string; 
   async run(a, ctx) {
     const original = await ctx.host.readFile(a.path);
     a.search = restoreCopiedEscapes(a.search, toLf(original).split("\n")).text;
-    let r = fuzzyApply(original, a.search, a.replace, { all: a.all });
     let where = "";
+    // A one-line `search` with a `replace` whose line breaks were escaped twice: `replace` alone decides.
+    if (!a.search.includes("\n") && !a.search.includes("\\n") && doubleEscaped(a.replace)) {
+      a.replace = unescapeBreaks(a.replace);
+      where = ESCAPE_NOTE;
+    }
+    let r = fuzzyApply(original, a.search, a.replace, { all: a.all });
     // `search` with `\n` typed as text: when its unescaped form is in the file, the model escaped twice.
     if (!r.ok && !r.matches && !a.search.includes("\n") && a.search.includes("\\n")) {
       const search = unescapeBreaks(a.search);
@@ -461,17 +550,39 @@ export const editFile: ToolDef<{ path: string; search: string; replace: string; 
         content = whole.content;
         note += ` (\`replace\` is a complete new ${whole.name}, so it replaced the whole old one, lines ${whole.from}-${whole.to})`;
       }
+      const searchLines = toLf(a.search).replace(/^(?:[ \t]*\n)+/, "").replace(/(?:\n[ \t]*)+$/, "").split("\n").length;
+      // `replace` re-typing the lines after `search` with some changed: the old ones would stay below (and override in Python).
+      const retyped = !whole && !a.all ? retypedTail(original, content, r.startLine, searchLines) : undefined;
+      if (retyped && !(await checkEditSyntax(a.path, original, retyped))) {
+        content = retyped;
+        note += RETYPED_NOTE;
+      }
       // `replace` repeating the lines around `search` (a second closing brace): replace them instead, if that parses.
-      if (!whole && !a.all && (await checkEditSyntax(a.path, original, content, a.replace))) {
-        const searchLines = toLf(a.search).replace(/^(?:[ \t]*\n)+/, "").replace(/(?:\n[ \t]*)+$/, "").split("\n").length;
+      if (!whole && !retyped && !a.all && (await checkEditSyntax(a.path, original, content, a.replace))) {
+        let repaired = false;
         for (const c of overlapCandidates(original, content, r.startLine, searchLines)) {
           if (await checkEditSyntax(a.path, original, c)) continue;
           content = c;
-          note += " (your `replace` repeated lines next to `search`; they were replaced, not duplicated)";
+          note += OVERLAP_NOTE;
+          repaired = true;
+          break;
+        }
+        // `search` was a block's first line and `replace` a complete block: it replaces the whole old block.
+        for (const c of repaired ? [] : blockCandidates(original, r.startLine, a.search, a.replace, findImbalance)) {
+          if (await checkEditSyntax(a.path, original, c)) continue;
+          content = c;
+          note += BLOCK_NOTE;
           break;
         }
       }
       return write(ctx, a.path, content, false, `edit ${a.path}`, note, a.replace);
+    }
+    // Redoing a change an earlier step (or todo) made: nothing to apply, and no reason to switch to line mode.
+    if (r.alreadyApplied) {
+      return {
+        ...fail(`Already done: ${a.path} already contains this change. If the current todo is complete, call done now; otherwise do the next step.`, `edit ${a.path}: already applied`),
+        noop: true,
+      };
     }
     const switched = ctx.edits.recordFailure(a.path);
     let out = `Edit failed: ${r.reason}`;
@@ -533,9 +644,35 @@ export const editLines: ToolDef<{ path: string; start_line: number; end_line: nu
   },
   async run(a, ctx) {
     if ((await ctx.host.stat(a.path)) === null) return createFile.run(a, ctx);
-    const r = applyLineRange(await ctx.host.readFile(a.path), a.start_line, a.end_line, a.content);
+    const original = await ctx.host.readFile(a.path);
+    const range = widenForReassignment(original, a.start_line, a.end_line, a.content);
+    const r = applyLineRange(original, range.start, range.end, a.content);
     if (!r.ok) return fail(`edit_lines failed: ${r.reason}`);
-    return write(ctx, a.path, r.content, false, `edit_lines ${a.path}:${a.start_line}-${a.end_line}`, escapeNote(a), a.content);
+    let note =
+      range.start !== a.start_line || range.end !== a.end_line
+        ? ` (the old assignment next to your range would have overridden your new one, so lines ${range.start}-${range.end} were replaced)`
+        : "";
+    // The same slips as with `edit`: a range that is only a block's first line, new text re-typing the lines after it.
+    let content = r.content;
+    const count = range.end - range.start + 1;
+    if (count > 0) {
+      const retyped = retypedTail(original, content, range.start, count);
+      if (retyped && !(await checkEditSyntax(a.path, original, retyped))) {
+        content = retyped;
+        note += RETYPED_NOTE;
+      } else if (await checkEditSyntax(a.path, original, content, a.content)) {
+        const rangeText = toLf(original).split("\n").slice(range.start - 1, range.end).join("\n");
+        const overlap = overlapCandidates(original, content, range.start, count).map((c) => ({ c, why: OVERLAP_NOTE }));
+        const block = blockCandidates(original, range.start, rangeText, a.content, findImbalance).map((c) => ({ c, why: BLOCK_NOTE }));
+        for (const { c, why } of [...overlap, ...block]) {
+          if (await checkEditSyntax(a.path, original, c)) continue;
+          content = c;
+          note += why;
+          break;
+        }
+      }
+    }
+    return write(ctx, a.path, content, false, `edit_lines ${a.path}:${range.start}-${range.end}`, escapeNote(a) + note, a.content);
   },
 };
 

@@ -1,5 +1,5 @@
 import { namedFiles } from "../agent/planner";
-import { isTestFile, TESTS_PROTECTED } from "../agent/testGuard";
+import { asksForTests, countTests, isTestFile, NO_NEW_TESTS, TESTS_PROTECTED } from "../agent/testGuard";
 import { enabledEditTools } from "../edit/formats";
 import { answer, done } from "./control";
 import { getDiagnostics } from "./diagnostics";
@@ -11,7 +11,7 @@ import { remember } from "./memoryTool";
 import { resolveWorkspacePath, writeForbidden } from "./paths";
 import { processLogs, startProcess } from "./processes";
 import { runCommand } from "./runCommand";
-import { search, semanticSearch } from "./search";
+import { search } from "./search";
 import { findDefinition, findReferences, renameSymbol } from "./symbolTools";
 import { fetchUrl, webSearchTool } from "./webTools";
 import type { ToolContext, ToolDef } from "./types";
@@ -25,7 +25,7 @@ export type AgentMode = "ask" | "agent" | "plan";
  * from the planner, and the loop itself asks the user only when a todo is stuck.
  */
 export const ALL_TOOLS: ToolDef[] = [
-  readFile, readSymbol, search, semanticSearch, listDir, getDiagnostics,
+  readFile, readSymbol, search, listDir, getDiagnostics,
   editFile, rewriteFile, editLines, createFile, runCommand,
   findDefinition, findReferences, renameSymbol,
   moveFile, deleteFile, gitDiff, gitLog, gitBlame,
@@ -57,6 +57,39 @@ async function unreadSources(path: string, ctx: ToolContext): Promise<string[]> 
     if ((await ctx.host.stat(r.path)) === "file") named.push(r.path);
   }
   return named;
+}
+
+const MOVE_FILE = /\b(?:move|rename)\s+`?([\w./-]+\.\w+)`?\s+(?:to|into|as)\s+`?([\w./-]+\.\w+)`?/gi;
+
+/** The existing file the user's message moves to `path` ("Move billing/utils.py to billing/money/format.py"). */
+async function movedFrom(path: string, ctx: ToolContext): Promise<string | undefined> {
+  for (const m of (ctx.message ?? "").matchAll(MOVE_FILE)) {
+    const from = resolveWorkspacePath(ctx.host.root, m[1]);
+    const to = resolveWorkspacePath(ctx.host.root, m[2]);
+    if ("error" in from || "error" in to || to.path !== path) continue;
+    if ((await ctx.host.stat(from.path)) === "file") return from.path;
+  }
+  return undefined;
+}
+
+/** How many test declarations a write adds to `args.path` (negative when it removes some). */
+async function addedTests(tool: string, args: Record<string, unknown>, ctx: ToolContext): Promise<number> {
+  const path = String(args.path);
+  const current = (await ctx.host.stat(path)) === "file" ? await ctx.host.readFile(path) : "";
+  const str = (v: unknown) => (typeof v === "string" ? v : "");
+  switch (tool) {
+    case "create_file":
+    case "rewrite_file":
+      return countTests(str(args.content)) - countTests(current);
+    case "edit":
+      return countTests(str(args.replace)) - countTests(str(args.search));
+    case "edit_lines": {
+      const lines = current.replace(/\r\n/g, "\n").split("\n");
+      return countTests(str(args.content)) - countTests(lines.slice(Number(args.start_line) - 1, Number(args.end_line)).join("\n"));
+    }
+    default:
+      return 0;
+  }
 }
 
 export interface Action {
@@ -182,6 +215,17 @@ export class ToolRegistry {
     if (ctx.seen && EDITS_EXISTING.has(tool.name) && !generated && typeof args.path === "string" && !ctx.seen.has(args.path) && (await ctx.host.stat(args.path)) === "file") {
       return { ok: false, policy: true, error: `You haven't read ${args.path} in this task. Read it first (read_file), then change it using its exact lines.` };
     }
+    // "Move a.py to pkg/b.py": creating the target by hand leaves the old file and every import of it behind.
+    if ((tool.name === "create_file" || tool.name === "rewrite_file") && typeof args.path === "string" && (await ctx.host.stat(args.path)) === null) {
+      const from = await movedFrom(args.path, ctx);
+      if (from) {
+        return {
+          ok: false,
+          policy: true,
+          error: `The user asked to move ${from} to ${args.path}: use move_file with from "${from}" and to "${args.path}". It moves the file and updates every import of it; writing ${args.path} by hand leaves ${from} and the old imports behind.`,
+        };
+      }
+    }
     // Code moving into a new file: read where it comes from first. Models wrote the new file from the
     // task's words (a tax formula lost its rounding) or as stubs.
     if (ctx.seen && tool.kind === "write" && typeof args.path === "string" && (await ctx.host.stat(args.path)) === null) {
@@ -194,6 +238,10 @@ export class ToolRegistry {
     const target = typeof args.path === "string" ? args.path : typeof args.from === "string" ? args.from : undefined;
     if (ctx.protectTests && tool.kind === "write" && tool.name !== "create_file" && target && isTestFile(target) && (await ctx.host.stat(target)) === "file") {
       return { ok: false, policy: true, error: `${target} ${TESTS_PROTECTED}` };
+    }
+    // New tests nobody asked for (updating existing ones, e.g. in a rename, stays allowed).
+    if (ctx.message !== undefined && !asksForTests(ctx.message) && tool.kind === "write" && target && isTestFile(target) && (await addedTests(tool.name, args, ctx)) > 0) {
+      return { ok: false, policy: true, error: `${target}: ${NO_NEW_TESTS}` };
     }
     const semantic = await tool.check?.(args, ctx);
     if (semantic) return { ok: false, error: semantic };

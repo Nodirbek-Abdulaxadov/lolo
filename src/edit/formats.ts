@@ -195,6 +195,34 @@ export type LineRangeResult = { ok: true; content: string } | { ok: false; reaso
  * Replaces lines start..end (1-based, inclusive) with `replacement`.
  * `end = start - 1` inserts before `start` without removing anything.
  */
+/** `target = value` (also `self.x`, `this.x`, a Python annotation); not `==`, `+=`, declarations. */
+const ASSIGNMENT = /^\s*((?:self\.|this\.)?[A-Za-z_$][\w$.]*)\s*(?::\s*[^=]+)?=(?!=)\s*(.*)$/;
+
+/** What a line assigns to, unless its value uses the target itself (`x = x + 1` is a second step, not a new version). */
+function assignedTarget(line: string | undefined): string | undefined {
+  const m = line === undefined ? null : ASSIGNMENT.exec(line);
+  if (!m) return undefined;
+  return new RegExp(`(?<![\\w$.])${m[1].replace(/[.$]/g, "\\$&")}(?![\\w$])`).test(m[2]) ? undefined : m[1];
+}
+
+/**
+ * An edit_lines range one line short: `content` ends with a new assignment to what the line after the
+ * range assigns (`self.tags = tags if tags is not None else []` above the old `self.tags = tags`), or
+ * starts with one to what the line before it assigns. The old line would override the new one, so the
+ * range is widened to replace it.
+ */
+export function widenForReassignment(original: string, start: number, end: number, content: string): { start: number; end: number } {
+  const lines = toLf(original).split("\n");
+  const repl = toLf(content).split("\n").filter((l) => l.trim());
+  if (!repl.length || end < start) return { start, end };
+  const last = assignedTarget(repl[repl.length - 1]);
+  const first = assignedTarget(repl[0]);
+  return {
+    start: first && start > 1 && assignedTarget(lines[start - 2]) === first ? start - 1 : start,
+    end: last && end < lines.length && assignedTarget(lines[end]) === last ? end + 1 : end,
+  };
+}
+
 export function applyLineRange(original: string, start: number, end: number, replacement: string): LineRangeResult {
   const eol = detectEol(original);
   const lines = toLf(original).split("\n");

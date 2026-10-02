@@ -14,6 +14,12 @@ function git(args: string[], ctx: ToolContext): Promise<{ code: number; out: str
   });
 }
 
+/** The file as last committed in the user's repository; undefined outside git or for a new file. */
+export async function committedVersion(path: string, ctx: ToolContext): Promise<string | undefined> {
+  const r = await git(["show", `HEAD:${path}`], ctx);
+  return r.code === 0 ? r.out : undefined;
+}
+
 async function mustExist(path: string | undefined, ctx: ToolContext): Promise<string | undefined> {
   return path && !(await ctx.host.stat(path)) ? `"${path}" does not exist.` : undefined;
 }

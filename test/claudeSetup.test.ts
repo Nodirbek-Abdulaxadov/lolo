@@ -63,6 +63,22 @@ describe("Claude Code setups", () => {
     expect(names("add a migration for the new column")).toEqual([]);
     expect(names("fix the null check in Form.razor")).toEqual([]);
     expect(skillBlock(skills[0])).toContain("python3 - <<'EOF'");
+    expect((await listSkills(host, null)).map((s) => s.name)).toEqual(["issue-tracker", "migration-squash"]);
+  });
+
+  it("takes the later word of a product name ('Claude Code') only with the words before it", () => {
+    const guard = parseSkill("---\nname: commit-guard-claude-code\ndescription: Set up Claude Code hooks that block risky commits. Use when the user wants commit checks in Claude Code.\n---\nSteps...", "x", "p");
+    expect(skillsFor("The parser crashes on empty input; fix the code in lib/", [guard])).toEqual([]);
+    expect(skillMentioned("Update the code in lib/parse.js", guard)).toBe(false);
+    expect(skillsFor("add the commit hooks to claude code", [guard])).toHaveLength(1);
+    expect(skillsFor("claude code skill bilan commitlarni tekshir", [guard])).toHaveLength(1);
+    // After a comma, still a product: "Jira, Confluence".
+    const wiki = parseSkill("---\nname: confluence-pages\ndescription: Keep notes in sync with Jira, Confluence and Slack.\n---\nSteps...", "x", "p");
+    expect(skillsFor("put this into the confluence page", [wiki])).toHaveLength(1);
+    // "skill" in a skill's name doesn't match every message that says "skill".
+    const writer = parseSkill("---\nname: write-a-skill\ndescription: Create new agent skills.\n---\nSteps...", "x", "p");
+    expect(skillsFor("confluence skill orqali sahifa och", [wiki, writer]).map((s) => s.name)).toEqual(["confluence-pages"]);
+    expect(skillsFor("/write-a-skill for releases", [writer])).toHaveLength(1);
   });
 
   it("turns Bash(...) permissions into the command allowlist and denylist", async () => {

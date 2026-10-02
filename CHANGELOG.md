@@ -1,5 +1,40 @@
 # Changelog
 
+## Unreleased
+
+Fixes for every failure of the 0.5.0 evaluation, done by code:
+
+- `node --test` failures are understood (its output without a terminal is TAP), and failing tests show the line of the assertion. Python's shared mutable default arguments are pointed out.
+- JavaScript that would throw at runtime is refused: a variable declared twice, `const tax = tax(a)`, undefined names, an export whose shape breaks another file's import.
+- More edit repairs: a whole function or block replaced when only its first line was quoted (also with `edit_lines`), re-typed lines not left behind, a line range one line short, regex escapes lost in JSON, C# regex escapes (CS1009), missing `using` for the project's own types, placeholder namespaces.
+- No tests the user didn't ask for; no "move" done by hand instead of move_file; no reverting a change the user asked to keep; comment-only "fixes" and redone changes are no-ops.
+- Runaway replies that repeat a block of code are stopped early.
+- Skills: a word of a skill's name that the description uses only inside a longer name ("Code" in "Claude Code") no longer loads the skill on its own, so "fix the code" doesn't pull in a Claude Code hooks skill. "skill" in a skill's name doesn't match every message that says "skill". The eval no longer reads `~/.claude/skills`.
+- A second import of a name is refused with the line of the existing import ("change that line"); models renamed the new import instead.
+- Copied regexes: `[+]` written for `\+` is restored with the rest of the line.
+- A todo that runs out of steps is complete when its changes pass the checks, as when it gets stuck.
+- A write that adds an import the file never uses says so ("imports `dataclass` but doesn't use it anywhere yet").
+
+Evaluation, 38 tasks × 2 runs, RTX 4070 Ti (Windows 11):
+
+| | qwen2.5-coder:7b | qwen3.5:9b | target |
+|---|---|---|---|
+| tool-call validity | 98.7% → 98.7% | 99.8% → 99.4% | ≥ 98% |
+| edit apply | 89.6% → 95.5% | 95.8% → 99.0% | ≥ 95% |
+| task pass | 78.9% → 89.5% | 93.4% → 96.1% | ≥ 60% |
+
+qwen2.5-coder:7b now meets all three targets of the plan (task pass over three runs: 90.8%, 88.2%, 89.5%). It still fails `go-chunk` (it decides the loop is already right) and often `git-fix-uncommitted` (arithmetic).
+
+**Fine-tune, retrained** on 4,059 samples from the passing runs (the same 12 tasks held out as before; the first `lolo-coder` had 2,044). On the 12 held-out tasks, 4 runs each, all with this orchestration:
+
+| | qwen2.5-coder:7b | lolo-coder (first) | lolo-coder (new) |
+|---|---|---|---|
+| task pass | 79.2% | 72.9% | 83.3% |
+| edit apply | 87.9% | 94.3% | 91.2% |
+| tool-call validity | 99.4% | 99.4% | 98.6% |
+
+The new model passes 2 more of the 48 held-out runs than the base model and 5 more than the first fine-tune: a small gain next to what orchestration gave the base model on the same tasks (72.9% → 79.2%).
+
 ## 0.6.0
 
 - **Claude Code hooks.** `UserPromptSubmit`, `PreToolUse`, `PostToolUse` and `Stop` hooks from `.claude/settings.json`, `.claude/settings.local.json` and `~/.claude/settings.json` run with Claude Code's contract (JSON on stdin, exit 2 blocks, `decision`/`permissionDecision`/`additionalContext` output) and tool names (`Bash`, `Edit|Write`, `mcp__…`). A PostToolUse hook that runs the tests after `dotnet build` now reports failures to the model; a Stop hook's block adds a todo. Trusted workspaces only; `localAgent.claudeHooks` / `--no-hooks` turn them off.

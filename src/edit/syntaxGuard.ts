@@ -1,4 +1,24 @@
-import { syntaxError } from "../context/treeSitter";
+import { syntaxError, withTree } from "../context/treeSitter";
+
+/**
+ * Regex escapes in normal C# strings: `"[\s-]+"` fails the build with CS1009 (C# knows only `\n`,
+ * `\t`, `\\` ... there), and models can't see why the "correct" pattern fails. The backslash is
+ * doubled by code (`"[\\s-]+"`); verbatim (`@"..."`) and raw strings are left alone. Invalid escapes
+ * never compile, so this can only help.
+ */
+export async function fixCSharpEscapes(path: string, text: string): Promise<{ text: string; fixed: number }> {
+  if (!/\.cs$/i.test(path) || !text.includes("\\")) return { text, fixed: 0 };
+  const spots =
+    (await withTree(path, text, (root) =>
+      root
+        .descendantsOfType(["string_literal_content"])
+        .filter((n) => n?.parent?.type === "string_literal")
+        .flatMap((n) => [...n!.text.matchAll(/\\(?=[^\\'"0abefnrtuUvx\n])/g)].map((m) => n!.startIndex + m.index!)),
+    )) ?? [];
+  let out = text;
+  for (const at of [...spots].sort((a, b) => b - a)) out = out.slice(0, at) + "\\" + out.slice(at);
+  return { text: out, fixed: spots.length };
+}
 
 /**
  * Cheap structural check for brace languages until tree-sitter lands: an edit that

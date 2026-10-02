@@ -7,3 +7,5 @@ dist/
 .agent/cache/
 eval/results/
 out/
+unsloth_compiled_cache/
+.vitest/

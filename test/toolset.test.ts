@@ -26,6 +26,23 @@ const registry = new ToolRegistry();
 const tool = (name: string) => ALL_TOOLS.find((t) => t.name === name)!;
 
 describe("toolNeeds", () => {
+  it("keeps a plain step at 8 tools; get_diagnostics comes with talk of errors", () => {
+    const { ctx } = workspace({});
+    const names = (todo: string) => {
+      ctx.needs = toolNeeds(todo);
+      return registry.enabled("agent", ctx).map((t) => t.name);
+    };
+    expect(names("Add a method total() to Cart in src/cart.js")).toHaveLength(8);
+    expect(names("Add a method total() to Cart in src/cart.js")).not.toContain("get_diagnostics");
+    expect(names("Fix the type errors in src/cart.ts")).toContain("get_diagnostics");
+  });
+
+  it("search with semantic=true falls back to text matches without an embedding model", async () => {
+    const { ctx } = workspace({ "a.js": "const hashPassword = (p) => p;\n" });
+    const r = await tool("search").run({ query: "hashPassword", semantic: true }, ctx);
+    expect(r.output).toMatch(/^\[Semantic search is off .*\]\na\.js:1:/);
+  });
+
   it("enables git tools only when the todo talks about git", () => {
     expect(toolNeeds("Show who changed src/a.ts last (git blame)").has("git")).toBe(true);
     expect(toolNeeds("Return null from findUser() in src/users.ts").size).toBe(0);

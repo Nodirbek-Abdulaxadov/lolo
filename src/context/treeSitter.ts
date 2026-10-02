@@ -261,6 +261,64 @@ export async function identifierOccurrences(file: string, text: string, name: st
   }
 }
 
+export type SyntaxNode = TSNode;
+
+/** `fn` applied to the syntax tree of `text` (freed afterwards); undefined when the language has no grammar. */
+export async function withTree<T>(file: string, text: string, fn: (root: SyntaxNode) => T): Promise<T | undefined> {
+  const lang = languageFor(file);
+  if (!lang) return undefined;
+  const l = await load(lang);
+  if (!l) return undefined;
+  const tree = l.parser.parse(text);
+  if (!tree) return undefined;
+  try {
+    return fn(tree.rootNode);
+  } finally {
+    tree.delete();
+  }
+}
+
+const COMMENTS = ["comment", "line_comment", "block_comment"];
+
+/**
+ * `text` without its comments, trailing spaces and empty lines (indentation kept: it is code in
+ * Python): two versions that differ only in comments give the same result.
+ */
+export async function codeWithoutComments(file: string, text: string): Promise<string | undefined> {
+  return withTree(file, text, (root) => {
+    let out = text;
+    const nodes = root.descendantsOfType(COMMENTS).filter((n): n is SyntaxNode => !!n);
+    for (const n of nodes.sort((a, b) => b.startIndex - a.startIndex)) out = out.slice(0, n.startIndex) + out.slice(n.endIndex);
+    return out.split(/\r?\n/).map((l) => l.trimEnd()).filter(Boolean).join("\n");
+  });
+}
+
+/** Whole-word occurrences of `name` inside comments; undefined when the language has no grammar. */
+export async function commentOccurrences(file: string, text: string, name: string): Promise<Occurrence[] | undefined> {
+  const lang = languageFor(file);
+  if (!lang) return undefined;
+  const l = await load(lang);
+  if (!l) return undefined;
+  if (!text.includes(name)) return [];
+  const tree = l.parser.parse(text);
+  if (!tree) return undefined;
+  try {
+    const word = new RegExp(`(?<![\\w$])${name.replace(/\$/g, "\\$")}(?![\\w$])`, "g");
+    const out: Occurrence[] = [];
+    for (const n of tree.rootNode.descendantsOfType(COMMENTS)) {
+      if (!n) continue;
+      for (const m of n.text.matchAll(word)) {
+        const start = n.startIndex + m.index!;
+        const before = text.slice(0, start);
+        out.push({ line: before.split("\n").length, column: start - before.lastIndexOf("\n") - 1, start, end: start + name.length });
+      }
+    }
+    return out.sort((a, b) => a.start - b.start);
+  } finally {
+    tree.delete();
+  }
+}
+
 /**
  * First syntax error in `text` ("line N: ..."), or undefined when it parses
  * cleanly or the language has no grammar.

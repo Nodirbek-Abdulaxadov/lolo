@@ -1,11 +1,11 @@
 import { nestedProjectProblem } from "../context/projectChecks";
 import { listFiles } from "../context/repoMap";
 import { decideCommand } from "./commandPolicy";
-import { missingUsings } from "./missingImports";
+import { missingUsings, projectTypes } from "./missingImports";
 import { relativizePaths, truncateOutput } from "./output";
 import { resolveWorkspacePath } from "./paths";
 import { startProcess } from "./processes";
-import { errorContext, failureReport } from "./testReport";
+import { errorContext, failureReport, lintHints, parseTestFailures } from "./testReport";
 import { fail, ok, ToolContext, ToolDef, ToolResult } from "./types";
 
 export const runCommand: ToolDef<{ command: string; cwd?: string }> = {
@@ -123,7 +123,8 @@ async function runIn(a: { command: string; cwd?: string }, ctx: ToolContext): Pr
   let fixed = "";
   const changed: string[] = [];
   if (r.exitCode !== 0) {
-    const fix = await missingUsings(r.output, ctx.host.root, (p) => ctx.host.readFile(p));
+    const read = (p: string) => ctx.host.readFile(p);
+    const fix = await missingUsings(r.output, ctx.host.root, read, async () => projectTypes(await listFiles(ctx.host), read));
     if (fix.changes.length && (await ctx.host.proposeWrites(fix.changes, "add missing using directives")).applied) {
       fixed = `${fix.note} Output after that fix:\n`;
       changed.push(...fix.changes.map((c) => c.path));
@@ -134,10 +135,12 @@ async function runIn(a: { command: string; cwd?: string }, ctx: ToolContext): Pr
   const created = (await listFiles(ctx.host)).filter((f) => !before.has(f)).sort();
   if (created.length) created.forEach((f) => (ctx.generated ??= new Set()).add(f));
   const newFiles = created.length ? `\nNew files (${created.length}): ${created.slice(0, 20).join(", ")}${created.length > 20 ? ", ..." : ""}` : "";
+  const failedTests = r.exitCode !== 0 && parseTestFailures(r.output, ctx.host.root).length > 0;
   const out =
     fixed +
     relativizePaths(r.exitCode === 0 ? truncateOutput(r.output) : failureReport(r.output, ctx.host.root), ctx.host.root) +
-    (r.exitCode === 0 ? "" : await errorContext(r.output, ctx.host.root, (p) => ctx.host.readFile(p)));
+    (r.exitCode === 0 ? "" : await errorContext(r.output, ctx.host.root, (p) => ctx.host.readFile(p))) +
+    (failedTests ? await lintHints(ctx.seen ?? [], (p) => ctx.host.readFile(p)) : "");
   const where = a.cwd && a.cwd !== "." ? ` (in ${a.cwd})` : "";
   const timeout = r.timedOut
     ? "\n[Timed out after 2 minutes and was stopped. Servers and watchers never finish; check your work with a build or tests instead.]"
@@ -145,7 +148,9 @@ async function runIn(a: { command: string; cwd?: string }, ctx: ToolContext): Pr
   // A project generated inside another project's folder breaks the outer build: say so now, and on every failing dotnet command.
   const layout =
     (created.some((f) => /\.(cs|fs|vb)proj$/.test(f)) || (r.exitCode !== 0 && /\bdotnet\b/.test(a.command))) && nestedProjectProblem([...before, ...created]);
-  const text = `$ ${a.command}${where}\nexit code ${r.exitCode}\n${out}${timeout}${newFiles}${layout ? `\n\nWarning: ${layout}` : ""}`;
+  // A passing build with compiler warnings (CS8765 ...): small models set out to fix them and break the build.
+  const warnings = r.exitCode === 0 && /\bwarning\s+[A-Z]{2,}\d{3,}\b/.test(r.output) ? "\n[It succeeded. The warnings don't block anything: leave them unless the task is about them.]" : "";
+  const text = `$ ${a.command}${where}\nexit code ${r.exitCode}\n${out}${warnings}${timeout}${newFiles}${layout ? `\n\nWarning: ${layout}` : ""}`;
   const summary = `run_command "${a.command}"${where}: ${r.timedOut ? "timed out" : `exit ${r.exitCode}`}${fixed ? " (after adding using directives)" : ""}`;
   return r.exitCode === 0 ? ok(text, summary, changed.length ? changed : undefined) : { ok: false, output: text, summary, changed: changed.length ? changed : undefined };
 }

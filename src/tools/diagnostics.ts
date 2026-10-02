@@ -11,6 +11,8 @@ export function formatDiagnostics(diags: Diagnostic[], max = 40): string {
 export const getDiagnostics: ToolDef<{ path?: string }> = {
   name: "get_diagnostics",
   kind: "read",
+  // Rarely called (0.3% of calls in the eval): new errors are reported after every write anyway.
+  group: "diagnostics",
   description: "Compiler/linter errors and warnings, for one file or the whole workspace.",
   params: { type: "object", properties: { path: { type: "string" } } },
   async run(a, ctx) {

@@ -27,6 +27,8 @@ export interface Plan {
   todos: string[];
   /** The planner exchange; appended to history so later steps reuse its KV cache. */
   messages: ChatMessage[];
+  /** The planner's own reply, before todos were merged, dropped or cleaned (for the trajectory log). */
+  raw: string;
 }
 
 /** Words that make a message a request for changes, even when phrased as a question ("can you add ...?"). */
@@ -104,15 +106,51 @@ const LOOK_ONLY = /^(read|review|identify|determine|locate|find|understand|analy
 const ASK_USER = /^(ask|confirm\s+with|check\s+with|wait\s+for)\b[^.]*\b(user|them|confirmation|approval)\b/i;
 /** A change verb (not the noun: "identify the change that broke it"). */
 const CHANGES = /(?<!\b(the|a|an|this|that|my|your|each|every|specific)\s+)\b(fix|change|update|add|remove|implement|replace|rename|move|create|write|edit|make|set|refactor|convert|delete|extract|use|return|handle)\b/i;
+/** A todo that points back at what an earlier one found ("Modify the identified line"). */
+const BACK_REFERENCE =
+  /\b(identified|located|found|mentioned|above)\b|\b(that|this|those|these|the same)\s+(line|lines|function|method|code|file|class|bug|issue|problem|mistake|error|change|place|spot|logic|calculation|expression|condition|loop)\b/i;
+
+const lowerFirst = (t: string) => (/^[A-Z][a-z]+\s/.test(t) ? t[0].toLowerCase() + t.slice(1) : t);
 
 /**
  * Todos that only look ("Read the changes with git diff", "Identify the change that broke
  * the tests", "Locate the test") are dropped: reading happens inside the todo that changes
  * something, and a separate looking todo makes small models redo (or undo) earlier work.
+ * When the next todo points back at them ("Modify the identified line"), they become its
+ * first part instead: dropped, they took the only mention of `restock` with them.
  */
 export function dropLookOnlyTodos(todos: string[], goal: string): string[] {
-  const kept = todos.filter((t) => (!LOOK_ONLY.test(t.trim()) || CHANGES.test(t)) && !ASK_USER.test(t.trim()));
+  const kept: string[] = [];
+  let looks: string[] = [];
+  for (const t of todos) {
+    if (ASK_USER.test(t.trim())) continue;
+    if (LOOK_ONLY.test(t.trim()) && !CHANGES.test(t)) {
+      looks.push(t.replace(/[.\s]+$/, ""));
+      continue;
+    }
+    kept.push(looks.length && BACK_REFERENCE.test(t) ? [...looks, t].map((x, i) => (i ? lowerFirst(x) : x)).join("; then ") : t);
+    looks = [];
+  }
   return kept.length ? kept : [goal || todos[0]];
+}
+
+/** Code after a colon: "…: export function computeTax(amount) { return amount * 0.12; }". */
+const CODE_TAIL = /[;{}]|=>|\b(function|def|return|import|export|const|let|var|class|public|private|func|require)\b/g;
+
+/**
+ * A todo with code written after a colon keeps only the sentence before it. Planners write
+ * code into the todo from the task's words (the tax formula without its rounding, `amount`
+ * where the function calls it `a`); the model then "fixes" correct code to match it.
+ * Backticked code (a command, a name) stays: that is the planner naming things, not coding.
+ */
+export function stripTodoCode(todo: string): string {
+  if (todo.includes("\n")) return todo;
+  const colon = /:\s+/.exec(todo);
+  if (!colon) return todo;
+  const tail = todo.slice(colon.index + colon[0].length);
+  if (tail.length < 20 || tail.includes("`") || (tail.match(CODE_TAIL) ?? []).length < 3) return todo;
+  const head = todo.slice(0, colon.index).replace(/\s+(with|containing|using|like|as)(\s+(the|this|following|new|code|content|contents|body|as follows))*$/i, "").trim();
+  return head.length >= 10 ? head : todo;
 }
 
 const TEST_TODO = /^(test|verify|validate|check|ensure)\b|\b(write|add|create)\s+(a\s+|some\s+|the\s+)?(unit\s+)?tests?\b|\bunit tests?\b/i;
@@ -144,8 +182,7 @@ export function mergeTodos(todos: string[]): string[] {
     const a = prev === undefined ? [] : namedFiles(prev);
     const b = namedFiles(t);
     // "Add ..." → "add ..." after "then"; a leading name ("TextUtils.cs: ...") keeps its case.
-    const next = /^[A-Z][a-z]+\s/.test(t) ? t[0].toLowerCase() + t.slice(1) : t;
-    if (a.length === 1 && b.length === 1 && sameFile(a[0], b[0])) out[out.length - 1] = `${prev.replace(/[.\s]+$/, "")}; then ${next}`;
+    if (a.length === 1 && b.length === 1 && sameFile(a[0], b[0])) out[out.length - 1] = `${prev.replace(/[.\s]+$/, "")}; then ${lowerFirst(t)}`;
     else out.push(t);
   }
   return out;
@@ -169,6 +206,6 @@ export async function makePlan(provider: LLMProvider, prefix: ChatMessage[], sig
   if (kind === "chat" && !reply) kind = kinds.includes("question") ? "question" : "chat"; // nothing to show: answer it properly
   if (kind === "chat" && !reply) reply = "Could you say a bit more about what you'd like me to do?";
   if (kind === "task" && !todos.length) todos = [goal || "Complete the task"];
-  todos = kind === "task" ? dropUnaskedTestTodos(dropLookOnlyTodos(mergeTodos(todos), goal), message).slice(0, 6) : todos;
-  return { kind, reply, goal, todos, messages: [request, { role: "assistant", content: JSON.stringify({ goal, kind, reply, todos }) }] };
+  todos = kind === "task" ? dropUnaskedTestTodos(dropLookOnlyTodos(mergeTodos(todos.map(stripTodoCode)), goal), message).slice(0, 6) : todos;
+  return { kind, reply, goal, todos, messages: [request, { role: "assistant", content: JSON.stringify({ goal, kind, reply, todos }) }], raw: res.content };
 }

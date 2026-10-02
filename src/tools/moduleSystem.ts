@@ -1,4 +1,6 @@
 import { listFiles } from "../context/repoMap";
+import { resolveSpec } from "./importPaths";
+import { filesWithWord } from "./symbolTools";
 import type { ToolContext } from "./types";
 
 const ESM = /^\s*(?:export\s+(?:\*|default\b|const\b|let\b|var\b|function\b|async\b|class\b|\{)|import\s+(?:[\w*{][^'"]*\s+from\s+)?['"])/m;
@@ -30,6 +32,42 @@ export function undefinedExports(path: string, text: string): string[] {
       "m",
     ).test(text);
   });
+}
+
+/** What the last `module.exports = ...` of a file assigns: an object of names, or one value (a class, a function). */
+function exportShape(text: string): "object" | "value" | undefined {
+  const all = [...text.matchAll(/^\s*module\.exports\s*=\s*(\S)/gm)];
+  const last = all[all.length - 1];
+  return last ? (last[1] === "{" ? "object" : "value") : undefined;
+}
+
+const REQUIRE_OBJECT = /\b(?:const|let|var)\s*\{[^}]*\}\s*=\s*require\(\s*(['"])(\.{1,2}\/[^'"]+)\1\s*\)/g;
+const REQUIRE_VALUE = /\b(?:const|let|var)\s+[A-Za-z_$][\w$]*\s*=\s*require\(\s*(['"])(\.{1,2}\/[^'"]+)\1\s*\)(?!\s*[.[(])/g;
+
+/**
+ * A CommonJS file whose export changes shape while other files load it the old way:
+ * `module.exports = { Cart }` → `module.exports = Cart` breaks `const { Cart } = require("./cart")`
+ * ("Cart is not a constructor"), and the other way round. Models rewrite the export line from memory
+ * during renames. Advice naming the importer, or undefined.
+ */
+export async function exportShapeProblem(path: string, before: string, after: string, ctx: ToolContext): Promise<string | undefined> {
+  if (!/\.c?js$/.test(path)) return undefined;
+  const was = exportShape(before);
+  const now = exportShape(after);
+  if (!was || !now || was === now) return undefined;
+  const files = new Set(await listFiles(ctx.host));
+  const stem = path.split("/").pop()!.replace(/\.[^.]+$/, "");
+  const pattern = was === "object" ? REQUIRE_OBJECT : REQUIRE_VALUE;
+  for (const f of await filesWithWord(ctx, stem === "index" ? path.split("/").slice(-2, -1)[0] ?? stem : stem)) {
+    if (f === path || !/\.(c|m)?jsx?$/.test(f)) continue;
+    const text = await ctx.host.readFile(f).catch(() => "");
+    for (const m of text.matchAll(pattern)) {
+      if (resolveSpec(f, m[2], (p) => files.has(p)) !== path) continue;
+      const exported = /^\s*module\.exports\s*=.*$/m.exec(before)?.[0].trim() ?? "";
+      return `${f} loads ${path} with \`${m[0].trim()}\`, which needs the export as it was (\`${exported}\`); after this change it would get ${was === "object" ? "undefined" : "an object"}. Leave the export as it is. The file was NOT changed.`;
+    }
+  }
+  return undefined;
 }
 
 /**

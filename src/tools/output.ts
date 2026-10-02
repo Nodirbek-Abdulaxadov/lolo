@@ -46,11 +46,12 @@ export function truncateOutput(text: string, maxLines = 120): string {
  * and what the tools take (`C:\Users\me\app\src\A.cs(3,5)` → `src/A.cs(3,5)`).
  */
 export function relativizePaths(text: string, root: string): string {
-  const variants = [...new Set([root, root.replace(/\\/g, "/"), root.replace(/\//g, "\\")])].map((v) => v.replace(/[\\/]+$/, ""));
+  // Also `C:\\Users\\me\\app` as quoted in node:test's TAP output.
+  const variants = [...new Set([root, root.replace(/\\/g, "/"), root.replace(/\//g, "\\"), root.replace(/[\\/]/g, "\\\\")])].map((v) => v.replace(/[\\/]+$/, ""));
   let out = text;
-  for (const v of variants) {
-    const re = new RegExp(`${v.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}[\\\\/]([^\\s:()\\[\\]'"]*)`, /^[a-zA-Z]:/.test(v) ? "gi" : "g");
-    out = out.replace(re, (_, rest: string) => rest.replace(/\\/g, "/"));
+  for (const v of variants.sort((a, b) => b.length - a.length)) {
+    const re = new RegExp(`${v.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}[\\\\/]+([^\\s:()\\[\\]'"]*)`, /^[a-zA-Z]:/.test(v) ? "gi" : "g");
+    out = out.replace(re, (_, rest: string) => rest.replace(/\\+/g, "/"));
   }
   return out;
 }

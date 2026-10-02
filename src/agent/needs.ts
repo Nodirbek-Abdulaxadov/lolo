@@ -16,6 +16,17 @@ const WEB =
 
 const MEMORY = /\bremember\b|\bfrom now on\b|\bnext time\b|\bkeep in mind\b|\bmemori[sz]e\b|eslab qol|esda tut|bundan keyin|запомни|впредь/i;
 
+const DIAGNOSTICS = /\b(errors?|warnings?|diagnostics?|problems?|lint\w*|type ?check\w*|compil\w*|red squiggl\w*)\b|(^|\s)@problems\b|xatolik|ошибк/i;
+
+/** A lasting convention stated in passing ("we always use pnpm", "our convention is ..."): worth offering to remember. */
+const CONVENTION =
+  /\b(we|I)\s+(always|never|usually|prefer to|only)\s+(use|write|run|put|keep|name|avoid|call)\b|\bin this (project|repo(sitory)?|codebase),?\s+(we|always|never)\b|\bour (convention|style|rule)s?\b|\bbiz (doim|hech qachon)\b/i;
+
+/** Whether the message states a project convention without asking to remember it. */
+export function statesConvention(message: string): boolean {
+  return CONVENTION.test(message) && !MEMORY.test(message);
+}
+
 /**
  * Optional tool groups a todo needs, decided from its text without the model:
  * every extra tool in the action schema is another wrong choice for a small model.
@@ -32,7 +43,8 @@ export function toolNeeds(todo: string, message = "", opts: { largeRepo?: boolea
   if (FILE_OPS.test(todo) || FILE_OPS.test(message)) needs.add("fileops");
   if (REFACTOR.test(todo)) needs.add("refactor");
   if (PROCESS.test(todo)) needs.add("process");
-  if (MEMORY.test(todo) || MEMORY.test(message)) needs.add("memory");
+  if (MEMORY.test(todo) || MEMORY.test(message) || CONVENTION.test(message)) needs.add("memory");
+  if (DIAGNOSTICS.test(todo) || DIAGNOSTICS.test(message)) needs.add("diagnostics");
   // Finding the place to change in a big repo takes many reads; a sub-agent keeps them out of this history.
   if (opts.largeRepo && !NAMES_FILE.test(todo) && !NAMES_FILE.test(message)) needs.add("explore");
   return needs;

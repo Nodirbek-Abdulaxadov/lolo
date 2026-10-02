@@ -88,8 +88,8 @@ export function parseSkill(raw: string, fallbackName: string, file: string): Ski
   return { name, summary: first.length > 160 ? first.slice(0, 157) + "..." : first, description, path: file, body };
 }
 
-/** Skills of the workspace, then the user's (~/.claude/skills) that the workspace doesn't override. */
-export async function listSkills(host: Host, userDir = path.join(homedir(), ".claude", "skills")): Promise<Skill[]> {
+/** Skills of the workspace, then the user's (~/.claude/skills) that the workspace doesn't override; `userDir` null: the workspace's only. */
+export async function listSkills(host: Host, userDir: string | null = path.join(homedir(), ".claude", "skills")): Promise<Skill[]> {
   const out: Skill[] = [];
   const names = new Set<string>();
   for (const dir of SKILL_DIRS) {
@@ -101,6 +101,7 @@ export async function listSkills(host: Host, userDir = path.join(homedir(), ".cl
       if (!names.has(s.name)) out.push(s), names.add(s.name);
     }
   }
+  if (userDir === null) return out;
   try {
     for (const e of readdirSync(userDir).sort()) {
       const file = path.join(userDir, e, "SKILL.md");
@@ -131,38 +132,44 @@ export function skillsFor(message: string, skills: Skill[]): Skill[] {
   return skills.filter((s) => {
     const name = s.name.toLowerCase();
     if (text.includes(`/${name}`) || new RegExp(`(^|[^\\w-])${name.replace(/[-]/g, "[- ]")}([^\\w-]|$)`).test(text)) return true;
-    const parts = name.split(/[-_\s]+/).filter((w) => w.length >= 3);
+    // "skill" in a name ("write-a-skill") is the word that marks every skill request, not this skill.
+    const parts = name.split(/[-_\s]+/).filter((w) => w.length >= 3 && !/^skills?$/.test(w));
     if (mentionsSkill && parts.some((w) => words.has(w))) return true;
     // "jira skill orqali ...": the product the skill is about, even when its name doesn't say it.
-    if (mentionsSkill && properNouns(s.description).some((w) => words.has(w))) return true;
-    return parts.some((w) => words.has(w) && properNoun(w, s.description));
+    if (mentionsSkill && [...words].some((w) => w.length >= 3 && namesProduct(w, s.description, text))) return true;
+    return parts.some((w) => words.has(w) && namesProduct(w, s.description, text));
   });
 }
 
 /** Generic capitalized terms that don't identify what a skill is about. */
 const GENERIC = new Set(["api", "rest", "http", "https", "json", "yaml", "url", "ui", "db", "sql", "cli", "ci", "ef", "core", "trigger", "skip", "use", "the", "never", "always", "todo"]);
 
-/** Capitalized words inside sentences of `text` ("work in Jira via", "Telegram relay"): products and services. */
-function properNouns(text: string): string[] {
-  const out = new Set<string>();
-  for (const m of text.matchAll(/[a-z,;:]\s+([A-Z][A-Za-z0-9]{2,})\b/g)) {
-    const w = m[1].toLowerCase();
-    if (!GENERIC.has(w)) out.add(w);
-  }
-  return [...out];
+/** Runs of capitalized words inside sentences of `text`, lowercased: "work in Jira via" → [jira], "set up Claude Code hooks" → [claude, code]. */
+function nameRuns(text: string): string[][] {
+  // After a word in lower case or one ending in , ; : ("Jira, Confluence"), not at a sentence start.
+  return [...text.matchAll(/(?<=(?:^|\s)(?:[a-z]\S*|\S*[,;:])\s+)[A-Z][A-Za-z0-9]*(?:[ \t]+[A-Z][A-Za-z0-9]*)*/g)].map((m) => m[0].toLowerCase().split(/[ \t]+/));
 }
 
-/** `word` appears capitalized inside a sentence of `text` (not only at its start), e.g. "work in Jira via". */
-function properNoun(word: string, text: string): boolean {
-  const cap = word[0].toUpperCase() + word.slice(1);
-  return new RegExp(`[a-z,;:]\\s+${cap}\\b`).test(text) || new RegExp(`\\b${word.toUpperCase()}\\b`).test(text);
+/**
+ * `word` (lowercase, from `text`) names a product the description is about: capitalized inside
+ * a sentence ("work in Jira via") or in capitals ("JIRA"). A later word of a longer name
+ * ("Claude Code", "EF Core") counts only when `text` has the name up to it ("claude code"):
+ * alone it is a common word ("fix the code").
+ */
+function namesProduct(word: string, description: string, text: string): boolean {
+  if (GENERIC.has(word)) return false;
+  if (new RegExp(`\\b${word.toUpperCase()}\\b`).test(description)) return true;
+  return nameRuns(description).some((run) => {
+    const i = run.indexOf(word);
+    return i === 0 || (i > 0 && text.includes(run.slice(0, i + 1).join(" ")));
+  });
 }
 
 /** Whether a todo refers to the skill (its name, or a product its name mentions: "Create Jira issue"). */
 export function skillMentioned(todo: string, s: Skill): boolean {
   const t = todo.toLowerCase();
   if (t.includes(s.name.toLowerCase())) return true;
-  return s.name.toLowerCase().split(/[-_\s]+/).some((w) => w.length >= 3 && new RegExp(`\\b${w}\\b`).test(t) && properNoun(w, s.description));
+  return s.name.toLowerCase().split(/[-_\s]+/).some((w) => w.length >= 3 && new RegExp(`\\b${w}\\b`).test(t) && namesProduct(w, s.description, t));
 }
 
 /** A skill's instructions for the task message. */

@@ -1,17 +1,18 @@
+import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
 import { laterTodoFor } from "../src/agent/loop";
-import { dropLookOnlyTodos, dropUnaskedTestTodos, mergeTodos, namedFiles } from "../src/agent/planner";
+import { dropLookOnlyTodos, dropUnaskedTestTodos, mergeTodos, namedFiles, stripTodoCode } from "../src/agent/planner";
 import { isTestFile, protectTests } from "../src/agent/testGuard";
 import { restoreCopiedEscapes } from "../src/edit/escapes";
-import { EditState } from "../src/edit/formats";
+import { EditState, widenForReassignment } from "../src/edit/formats";
 import { fuzzyApply } from "../src/edit/fuzzyApply";
 import { NodeHost } from "../src/host/nodeHost";
 import { resolveProfile } from "../src/providers/modelProfiles";
 import { createFile, doubleEscaped, editFile, editLines, rewriteFile } from "../src/tools/fileTools";
-import { addUsing, missingUsings, workspacePath } from "../src/tools/missingImports";
+import { addUsing, missingUsings, placeholderNamespaceFix, projectTypes, workspacePath } from "../src/tools/missingImports";
 import { toCommonJs, undefinedExports } from "../src/tools/moduleSystem";
 import { relativizePaths } from "../src/tools/output";
 import { errorContext } from "../src/tools/testReport";
@@ -38,6 +39,96 @@ function workspace(files: Record<string, string>) {
   const ctx: ToolContext = { host: new NodeHost(root, { autoApprove: true }), profile: resolveProfile("qwen2.5-coder:7b"), edits: new EditState(), commandAllowlist: [] };
   return { root, ctx, read: (f: string) => readFileSync(path.join(root, f), "utf8") };
 }
+
+describe("edit_lines one line short, and a replace escaped twice", () => {
+  const shop = "class Order:\n    def __init__(self, sku, qty, notes=[]):\n        self.sku = sku\n        self.qty = qty\n        self.notes = notes\n\n    def note(self, text):\n        self.notes.append(text)\n";
+
+  it("replaces the old assignment the new content redoes, and leaves real second steps", async () => {
+    const { ctx, read } = workspace({ "shop.py": shop });
+    ctx.edits.forceLineRange("shop.py");
+    const content = "    def __init__(self, sku, qty, notes=None):\n        self.sku = sku\n        self.qty = qty\n        self.notes = notes if notes is not None else []\n";
+    const r = await editLines.run({ path: "shop.py", start_line: 2, end_line: 4, content }, ctx);
+    expect(r.ok).toBe(true);
+    expect(r.output).toContain("lines 2-5 were replaced");
+    expect(read("shop.py")).toBe(shop.replace("notes=[]", "notes=None").replace("self.notes = notes\n", "self.notes = notes if notes is not None else []\n"));
+    expect(widenForReassignment("x = 1\nx = x + 1\n", 1, 1, "x = 2")).toEqual({ start: 1, end: 1 });
+    expect(widenForReassignment("a = 1\nb = 2\n", 1, 1, "a = 3")).toEqual({ start: 1, end: 1 });
+  });
+
+  it("replaces the whole block when an edit_lines range is only its first line", async () => {
+    const lib = "function fee(total) {\n  // Round to cents.\n  return Math.round(total * 3) / 10;\n}\n\nmodule.exports = { fee };\n";
+    const { ctx, read } = workspace({ "lib/fee.js": lib });
+    ctx.edits.forceLineRange("lib/fee.js");
+    const content = "function fee(total) {\n  // Round to cents.\n  return Math.round(total * 3) / 100;\n}";
+    const r = await editLines.run({ path: "lib/fee.js", start_line: 1, end_line: 1, content }, ctx);
+    expect(r.ok).toBe(true);
+    expect(read("lib/fee.js")).toBe(lib.replace("/ 10;", "/ 100;"));
+  });
+
+  it("unescapes a multi-line `replace` written with \\\\n when `search` is one line", async () => {
+    const { ctx, read } = workspace({ "shop.py": shop });
+    ctx.seen = new Set(["shop.py"]);
+    const replace = "def __init__(self, sku, qty, notes=None):\\n        self.sku = sku\\n        self.qty = qty\\n        self.notes = notes if notes is not None else []";
+    const r = await editFile.run({ path: "shop.py", search: "    def __init__(self, sku, qty, notes=[]):\n        self.sku = sku\n        self.qty = qty\n        self.notes = notes".split("\n")[0].trim(), replace }, ctx);
+    expect(r.ok).toBe(true);
+    // The re-typed body replaced the old one instead of staying above it.
+    expect(read("shop.py")).toBe(shop.replace("notes=[]", "notes=None").replace("self.notes = notes\n", "self.notes = notes if notes is not None else []\n"));
+    expect(r.output).toContain("the old ones were replaced");
+  });
+});
+
+describe("undoing an uncommitted change the user asked to keep", () => {
+  const committed = "function fee(total) {\n  return total * 0.03;\n}\n\nmodule.exports = { fee };\n";
+  const changed = "function fee(total) {\n  // Round to cents.\n  return Math.round(total * 3) / 10;\n}\n\nmodule.exports = { fee };\n";
+
+  function repo(message: string) {
+    const w = workspace({ "lib/fee.js": committed });
+    const git = (...args: string[]) => execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false", ...args], { cwd: w.root, stdio: "pipe" });
+    git("init", "-q");
+    git("add", "-A");
+    git("commit", "-qm", "start");
+    writeFileSync(path.join(w.root, "lib/fee.js"), changed);
+    w.ctx.message = message;
+    return w;
+  }
+
+  it("refuses to restore the committed file, unless the model insists", async () => {
+    const { ctx, read } = repo("My change to lib/fee.js broke the tests. Fix it but keep the rounding to cents I added.");
+    const first = await rewriteFile.run({ path: "lib/fee.js", content: committed }, ctx);
+    expect(first.ok).toBe(false);
+    expect(first.output).toContain('they asked to keep part of it ("…');
+    expect(read("lib/fee.js")).toBe(changed);
+    expect((await rewriteFile.run({ path: "lib/fee.js", content: committed }, ctx)).ok).toBe(true);
+  });
+
+  it("allows it when nothing is to be kept, and allows real fixes", async () => {
+    expect((await rewriteFile.run({ path: "lib/fee.js", content: committed }, repo("My change to lib/fee.js broke the tests, undo it.").ctx)).ok).toBe(true);
+    const fixed = changed.replace("Math.round(total * 3) / 10", "Math.round(total * 3) / 100");
+    expect((await rewriteFile.run({ path: "lib/fee.js", content: fixed }, repo("Fix it but keep the rounding to cents.").ctx)).ok).toBe(true);
+  });
+});
+
+describe("search that is only the first line of a block", () => {
+  const spec = 'const test = require("node:test");\nconst assert = require("node:assert");\nconst { Queue } = require("../lib/queue");\n\ntest("fifo", () => {\n  const q = new Queue();\n  q.push(1);\n  assert.strictEqual(q.pop(), 1);\n});\n';
+
+  it("replaces the whole old block when `replace` holds it plus a new one", async () => {
+    const { ctx, read } = workspace({ "spec/queue.test.js": spec });
+    const replace = 'test("fifo", () => {\n  const q = new Queue();\n  q.push(1);\n  assert.strictEqual(q.pop(), 1);\n});\n\ntest("empty", () => {\n  assert.strictEqual(new Queue().pop(), undefined);\n});';
+    const r = await editFile.run({ path: "spec/queue.test.js", search: 'test("fifo", () => {', replace }, ctx);
+    expect(r.ok).toBe(true);
+    expect(r.output).toContain("replaced the whole old block");
+    expect(read("spec/queue.test.js")).toBe(spec.replace(/\n$/, "") + '\n\ntest("empty", () => {\n  assert.strictEqual(new Queue().pop(), undefined);\n});\n');
+  });
+
+  it("replaces a whole function whose first line comes after other lines of `search`", async () => {
+    const lib = "let seq = 1;\n\nfunction makeOrder(item) {\n  if (!item) throw new Error(\"no item\");\n  return { id: seq++, item };\n}\n\nmodule.exports = { makeOrder };\n";
+    const { ctx, read } = workspace({ "lib/orders.js": lib, "lib/check.js": "exports.valid = (x) => !!x;\n" });
+    const replace = 'const check = require("./check");\n\nlet seq = 1;\n\nfunction makeOrder(item) {\n  if (!check.valid(item)) throw new Error("no item");\n  return { id: seq++, item };\n}\n\nmodule.exports = { makeOrder };';
+    const r = await editFile.run({ path: "lib/orders.js", search: "let seq = 1;\n\nfunction makeOrder(item) {", replace }, ctx);
+    expect(r.ok).toBe(true);
+    expect(read("lib/orders.js")).toBe(replace + "\n");
+  });
+});
 
 describe("ambiguous search", () => {
   const search = "  inv.stock.set(key, inv.stock.get(key) - qty);";
@@ -333,12 +424,26 @@ module.exports = { validateEmail };
     expect(r.output).toContain("restored");
     expect(read("src/validators.js")).toBe(users);
     const spaced = "function validateEmail(email) {\n  return /^[^\\ @]+@[^\\ @]+\\.[^\\ @]+$/.test(email);\n}\n\nmodule.exports = { validateEmail };\n";
-    expect((await rewriteFile.run({ path: "src/validators.js", content: spaced.replace("email)", "e)") }, ctx)).ok).toBe(true);
+    expect((await rewriteFile.run({ path: "src/validators.js", content: spaced.replace("module.exports = { validateEmail };", "const MAX_EMAIL = 254;\n\nmodule.exports = { validateEmail, MAX_EMAIL };") }, ctx)).ok).toBe(true);
     expect(read("src/validators.js")).toContain(String.raw`/^[^\s@]+@[^\s@]+\.[^\s@]+$/`);
     // A stray line break before an escape the model did write, or in front of `\+`.
     expect(restoreCopiedEscapes("    return /^[^\n\\s@]+@[^\n\\s@]+\\.[^\n\\s@]+$/.test(email);", users.split("\n")).text).toBe(String.raw`    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);`);
     const phone = String.raw`  return /^\+?[0-9 ]{7,15}$/.test(phone);`;
     expect(restoreCopiedEscapes("    return /^\n\\+?[0-9 ]{7,15}$/.test(phone);\n  }", [phone])).toEqual({ text: String.raw`    return /^\+?[0-9 ]{7,15}$/.test(phone);` + "\n  }", fixed: 1 });
+    // The backslash kept and the escaped character lost: `[^\` + line break + `@]`, `/^\` + line break + `?`.
+    const kept = "    return /^[^\\\n@]+@[^\\\n@]+\\.[^\\\n@]+$/.test(email);\n  },\n  validatePhone: function(phone) {\n    return /^\\\n?[0-9 ]{7,15}$/.test(phone);";
+    expect(restoreCopiedEscapes(kept, [...users.split("\n"), phone])).toEqual({
+      text: String.raw`    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);` + "\n  },\n  validatePhone: function(phone) {\n" + String.raw`    return /^\+?[0-9 ]{7,15}$/.test(phone);`,
+      fixed: 2,
+    });
+    // Every escape (`\.` too) as a bare line break, and `\+?` lost with its quantifier.
+    const bare = "    return /^[^\n@]+@[^\n@]+\n[^\n@]+$/.test(email);\n    return /^\n[0-9 ]{7,15}$/.test(phone);";
+    expect(restoreCopiedEscapes(bare, [...users.split("\n"), phone]).text).toBe(
+      String.raw`    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);` + "\n" + String.raw`    return /^\+?[0-9 ]{7,15}$/.test(phone);`,
+    );
+    // `[+]` and `[.]` written for `\+` and `\.` (the same regex), next to `\d` lost as a line break.
+    const amount = String.raw`  if (!/^\+?\d+(\.\d+)?$/.test(amount)) return null;`;
+    expect(restoreCopiedEscapes("    if (!/^\n[+]?\n+([.]\n+)?$/.test(amount)) return null;", [amount])).toEqual({ text: "  " + amount, fixed: 1 });
     // Code that is really on several lines stays so.
     expect(restoreCopiedEscapes("foo(\n  bar);", ["foo(bar);"]).fixed).toBe(0);
     // `search` too, against the file being edited.
@@ -430,6 +535,25 @@ describe("mergeTodos", () => {
     expect(dropLookOnlyTodos(["Check the /health endpoint with curl"], "g")).toEqual(["Check the /health endpoint with curl"]);
   });
 
+  it("keeps a look-only todo as the first part of a todo that points back at it", () => {
+    expect(dropLookOnlyTodos(["Open lib/ledger.js.", "Locate the line in applyRefund that computes the balance.", "Change the identified line so refunds add to the balance."], "g")).toEqual([
+      "Open lib/ledger.js; then locate the line in applyRefund that computes the balance; then change the identified line so refunds add to the balance.",
+    ]);
+    expect(dropLookOnlyTodos(["Find where applyRefund updates the balance.", "Fix that calculation.", "Update the changelog."], "g")).toEqual([
+      "Find where applyRefund updates the balance; then fix that calculation.",
+      "Update the changelog.",
+    ]);
+  });
+
+  it("strips code the planner wrote into a todo after a colon", () => {
+    expect(stripTodoCode("Create a new file lib/fees.js with the content: function fee(total) { return total * 0.03; } module.exports = { fee };")).toBe("Create a new file lib/fees.js");
+    expect(stripTodoCode("Edit lib/cart.js to use fee: const { fee } = require('./fees'); function total(items) { return sum(items) + fee(sum(items)); }")).toBe("Edit lib/cart.js to use fee");
+    // Plain sentences, backticked names and short snippets stay.
+    for (const t of ["Paging.cs: throw for size 0", "Run `dotnet new console -n App`: it creates the project", "Fix lib/a.js: the loop skips the last item", "Add a method: `peek()` returns the top item"]) {
+      expect(stripTodoCode(t)).toBe(t);
+    }
+  });
+
   it("drops test todos the user didn't ask for", () => {
     const todos = ["Override Equals and GetHashCode in Money.cs", "Test equality logic with unit tests"];
     expect(dropUnaskedTestTodos(todos, "Two Money values with the same Amount must be equal.")).toEqual([todos[0]]);
@@ -466,6 +590,27 @@ describe("missing using directives", () => {
     expect(r.changes[0].content).toBe("using System.Text.RegularExpressions;\n\nnamespace Demo;\n");
     expect(r.note).toContain("`using System.Text;` to src/Report.cs");
     expect(workspacePath("D:\\other\\A.cs", root)).toBeUndefined();
+  });
+
+  it("adds the using of a type the project declares in another namespace", async () => {
+    const files: Record<string, string> = { "Clocks/IClock.cs": "namespace Shop.Clocks;\n\npublic interface IClock { DateTime Now { get; } }\n", "Greeter.cs": "namespace Shop;\n\npublic class Greeter { }\n" };
+    const read = async (p: string) => files[p];
+    const out = "Greeter.cs(5,22): error CS0246: The type or namespace name 'IClock' could not be found (are you missing a using directive or an assembly reference?)\n";
+    const r = await missingUsings(out, "/ws", read, () => projectTypes(Object.keys(files), read));
+    expect(r.changes).toEqual([{ path: "Greeter.cs", content: "using Shop.Clocks;\n\nnamespace Shop;\n\npublic class Greeter { }\n" }]);
+  });
+
+  it("gives a new file in a placeholder namespace the project's namespace", () => {
+    const others = ["namespace Shop;\n\npublic class Greeter { }\n", "namespace Shop;\npublic class A { }\n"];
+    expect(placeholderNamespaceFix("namespace YourNamespace { public interface IClock { } }", others)).toEqual({ content: "namespace Shop { public interface IClock { } }", from: "YourNamespace", to: "Shop" });
+    expect(placeholderNamespaceFix("namespace Shop.Clocks;\npublic interface IClock { }", others)).toBeUndefined(); // a real sub-namespace
+    expect(placeholderNamespaceFix("namespace MyNamespace;", ["namespace A;", "namespace B;"])).toBeUndefined(); // no single project namespace
+  });
+
+  it("knows the nullability attributes (NotNullWhen reports its Attribute name too)", async () => {
+    const out = "Point.cs(9,34): error CS0246: The type or namespace name 'NotNullWhenAttribute' could not be found\nPoint.cs(9,34): error CS0246: The type or namespace name 'NotNullWhen' could not be found\n";
+    const r = await missingUsings(out, "/ws", async () => "namespace Geo;\n");
+    expect(r.changes).toEqual([{ path: "Point.cs", content: "using System.Diagnostics.CodeAnalysis;\n\nnamespace Geo;\n" }]);
   });
 });
 

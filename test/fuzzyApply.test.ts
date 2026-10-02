@@ -53,6 +53,12 @@ describe("fuzzyApply stale edits", () => {
     const r = fuzzyApply(edited, "    return this.items.reduce((sum, i) => sum + i.price, 0);", "    return this.items.reduce((sum, i) => sum + i.price * i.qty, 0);");
     expect(r.ok).toBe(false);
     expect(!r.ok && r.reason).toMatch(/already applied/);
+    expect(!r.ok && r.alreadyApplied).toBe(true);
+  });
+
+  it("doesn't call a short `replace` found elsewhere an applied change", () => {
+    const r = fuzzyApply("function a() {\n  return x;\n}\n", "  return y + 1;", "  return x;");
+    expect(!r.ok && r.alreadyApplied).toBe(false);
   });
 });
 

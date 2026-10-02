@@ -1,5 +1,18 @@
 import { describe, expect, it } from "vitest";
-import { checkEditStructure, checkEditSyntax, cutOffLine, findImbalance } from "../src/edit/syntaxGuard";
+import { checkEditStructure, checkEditSyntax, cutOffLine, findImbalance, fixCSharpEscapes } from "../src/edit/syntaxGuard";
+
+describe("fixCSharpEscapes", () => {
+  it("doubles regex escapes in normal strings, leaving valid escapes, verbatim and raw strings", async () => {
+    const src = 'class A {\n  string a = "[\\s-]+\\n";\n  string b = @"[\\s]";\n  string c = """raw\\s""";\n  string d = "tab\\t, quote \\" and \\\\d";\n}\n';
+    const r = await fixCSharpEscapes("A.cs", src);
+    expect(r.fixed).toBe(1);
+    expect(r.text).toContain('string a = "[\\\\s-]+\\n";');
+    expect(r.text).toContain('string b = @"[\\s]";');
+    expect(r.text).toContain('string c = """raw\\s""";');
+    expect(r.text).toContain('string d = "tab\\t, quote \\" and \\\\d";');
+    expect((await fixCSharpEscapes("a.js", '"\\s"')).fixed).toBe(0);
+  });
+});
 
 describe("findImbalance", () => {
   it("accepts balanced code with brackets inside strings and comments", () => {

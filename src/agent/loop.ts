@@ -20,8 +20,8 @@ import { codeStillUses } from "../tools/symbolTools";
 import { mentionsPath, stillReferenced } from "../tools/importPaths";
 import { EXTRACT_PROMPT } from "../tools/webTools";
 import type { WebConfig } from "../web/search";
-import { errorContext, failureReport } from "../tools/testReport";
-import { missingUsings } from "../tools/missingImports";
+import { errorContext, failureReport, lintHints, parseTestFailures } from "../tools/testReport";
+import { missingUsings, projectTypes } from "../tools/missingImports";
 import { relativizePaths } from "../tools/output";
 import type { McpHub, McpToolDef } from "../mcp/hub";
 import { selectMcpTools } from "../mcp/select";
@@ -29,7 +29,7 @@ import { Action, AgentMode, ToolRegistry } from "../tools/registry";
 import type { ToolContext, ToolDef, ToolResult } from "../tools/types";
 import { History, mergeConsecutive } from "./compaction";
 import { claudeTool, HookOutcome, Hooks } from "./hooks";
-import { toolNeeds } from "./needs";
+import { statesConvention, toolNeeds } from "./needs";
 import { protectTests } from "./testGuard";
 import { makePlan } from "./planner";
 import { PLAN_REQUEST, QUESTION_NOTE, systemPrompt, taskMessage, todoPrompt } from "./prompts";
@@ -71,6 +71,8 @@ export interface AgentDeps {
   nested?: boolean;
   /** Run Claude Code hooks from .claude/settings*.json and ~/.claude/settings.json (default true). */
   claudeHooks?: boolean;
+  /** Offer the user's skills from ~/.claude/skills besides the workspace's (default true). */
+  userSkills?: boolean;
 }
 
 /** Repositories with at least this many code files get the explore tool for vague todos. */
@@ -165,14 +167,34 @@ const MAX_STOP_BLOCKS = 2;
 /** Stop and ask the user after this many consecutive failed or invalid steps. */
 const MAX_CONSECUTIVE_FAILURES = 4;
 /**
- * Whether the reply so far ends with the same line many times in a row. Lines are split on
- * real line breaks and on `\n` escapes, since file content inside the JSON reply is escaped.
+ * Whether the reply so far ends with the same line, or the same block of up to 8 lines, many
+ * times in a row (qwen2.5-coder repeated a comment, a commented-out `return` and a blank line
+ * until the token limit). Lines are split on real line breaks and on `\n` escapes, since file
+ * content inside the JSON reply is escaped.
  */
 export function repeatsLine(text: string, times = 16): boolean {
   const lines = text.split(/\\n|\n/).slice(0, -1); // the last one may still be growing
-  if (lines.length < times) return false;
-  const tail = lines.slice(-times);
-  return tail[0].trim().length >= 3 && tail.every((l) => l === tail[0]);
+  if (cycles(lines, 1, (p) => Math.max(times, p * 6))) return true;
+  // The same shape with other names: `function calculateTaxFromItems(items) { return items.reduce(...) }`
+  // for every combination the model can think of. Only blocks, repeated at length (similar one-liners
+  // such as constant tables are normal code).
+  const shapes = lines.map((l) => l.replace(/[A-Za-z_$][\w$]*/g, "x").replace(/\d+(\.\d+)?/g, "0"));
+  return cycles(shapes, 2, (p) => Math.max(40, p * 10));
+}
+
+/** Whether `lines` end with a block of `minPeriod`..8 lines repeated over at least `length(period)` lines. */
+function cycles(lines: string[], minPeriod: number, length: (period: number) => number): boolean {
+  for (let period = minPeriod; period <= 8; period++) {
+    const n = length(period);
+    if (lines.length < n) break;
+    const tail = lines.slice(-n);
+    const block = tail.slice(0, period);
+    // A block needs real content: `}` or a/b alternating lines are not a loop; a block of one repeated
+    // line is left to period 1 (for shapes, a table of one-liners).
+    if (block.join("").replace(/\s/g, "").length < (period === 1 ? 3 : 8) || (period > 1 && new Set(block).size < 2)) continue;
+    if (tail.every((l, i) => l === block[i % period])) return true;
+  }
+  return false;
 }
 
 /** Tools whose written content the model wrote itself (so it has "seen" the file afterwards). */
@@ -225,7 +247,7 @@ export class Agent {
       const rules = await loadRules(host);
       // Claude Code setups: CLAUDE.md/AGENTS.md, skills, permissions (context/claudeSetup.ts).
       const instructions = await loadInstructions(host);
-      const skills = await listSkills(host);
+      const skills = await listSkills(host, this.deps.userSkills === false ? null : undefined);
       const wanted = skillsFor(task, skills);
       // A short follow-up ("och", "open it", "do it") continues the request before it: its skill still applies.
       if (!wanted.length && opts.conversation && task.trim().length <= 60) {
@@ -296,7 +318,7 @@ export class Agent {
       } else {
         emit({ type: "status", text: "Planning" });
         const plan = await makePlan(provider, prefix, signal, task);
-        log?.llm("plan", [...prefix, plan.messages[0]], plan.messages[1].content, {});
+        log?.llm("plan", [...prefix, plan.messages[0]], plan.messages[1].content, plan.raw.trim() !== plan.messages[1].content ? { raw: plan.raw } : {});
         log?.write("classified", { kind: plan.kind });
         if (plan.kind === "chat") return finish("done", plan.reply);
         if (plan.kind === "question") {
@@ -419,8 +441,9 @@ export class Agent {
       return { ok: true, summary: `Already done: ${renamed[0]} was renamed to ${renamed[1]} everywhere.` };
     }
     // A later todo that updates the imports of a file move_file already moved (planners split "move X" into move + fix imports).
-    const moved = [...(ctx.moved ?? [])].find(([from]) => mentionsPath(todos[index], from));
-    if (moved && /\b(import|require|reference|usage|use|point|update|fix)/i.test(todos[index]) && !(await stillReferenced(ctx, moved[0]))) {
+    // Also a later todo that restates the move itself ("Move the content of a.py to b.py"): the model moved the file back.
+    const moved = [...(ctx.moved ?? [])].find(([from, to]) => mentionsPath(todos[index], from) || mentionsPath(todos[index], to));
+    if (moved && /\b(import|require|reference|usage|use|point|update|fix|mov(e|ing)|content|cop(y|ies)|creat\w*)/i.test(todos[index]) && !(await stillReferenced(ctx, moved[0]))) {
       history.note(`Todo ${index + 1} was already done: move_file updated every import of ${moved[0]} (now ${moved[1]}).`);
       log?.write("todo_done", { index, summary: "already done by move_file", auto: "move" });
       return { ok: true, summary: `Already done: the imports of ${moved[0]} were updated when it moved to ${moved[1]}.` };
@@ -432,6 +455,10 @@ export class Agent {
     ctx.mcpTools = selectMcpTools(this.registry.all.filter((t): t is McpToolDef => t.group === "mcp"), todos[index], s.task);
     const extra = this.registry.enabled(mode, ctx).filter((t) => t.group && t.group !== "symbols");
     if (extra.length) history.note(`Extra tools for this todo:\n${this.registry.describe(extra)}`);
+    // A convention said in passing: offered to memory once, at the last todo; the user reviews the write.
+    if (mode === "agent" && index === todos.length - 1 && statesConvention(s.task) && extra.some((t) => t.name === "remember")) {
+      history.note("The user's message states a lasting convention of this project. After the work, if it isn't in the project memory yet, save it with remember (one sentence); the user reviews it.");
+    }
     if (ctx.needs.has("web") && !ctx.web && /(^|\s)@web\b/.test(s.task)) {
       history.note("Web access is off, so you cannot search the web. Answer from the code and what you know, and tell the user that web search can be enabled in the setting localAgent.web.search.");
     }
@@ -452,7 +479,7 @@ export class Agent {
       if (!changedInTodo) return false;
       const checks = s.rules.verifyCommands.length ? s.rules.verifyCommands : await detectChecks(host);
       if (!checks.length) return allowNoChecks;
-      return !(await this.verify(checks, emit, (files) => files.forEach((f) => s.changed.add(f))));
+      return !(await this.verify(checks, emit, (files) => files.forEach((f) => s.changed.add(f)), ctx.seen));
     };
     const completeAuto = (why: string) => {
       const summary = `Completed: ${todos[index]}.`;
@@ -466,6 +493,15 @@ export class Agent {
      */
     /** Question mode, stuck: the model has usually read enough but keeps looking. Only `answer` is offered from now on. */
     let answerNow = false;
+    /**
+     * Agent mode, stuck while only looking (git_diff, git_blame, read_file, search in a circle): it has
+     * seen the code but doesn't dare to change it. Once per todo, only the file-writing tools are offered
+     * until a write applies.
+     */
+    let writeNow = false;
+    let forcedWrite = false;
+    /** No write was attempted (even a refused one) since the last write that applied. */
+    let onlyLooking = true;
     const onStuck = async (problem: string, failSummary: string) => {
       if (await checksPass(false)) return completeAuto("stuck, but checks pass");
       if (mode === "ask" && !answerNow) {
@@ -474,6 +510,16 @@ export class Agent {
         repeats = 0;
         log?.write("stuck", { forceAnswer: true });
         history.note("Stop looking: you have what you need. Call answer now with the best answer from what you found above.");
+        return undefined;
+      }
+      // Only before the todo changed anything: after a change, a forced write is a guess (qwen3.5 removed a working `return`).
+      if (mode === "agent" && onlyLooking && !changedInTodo && !forcedWrite && !/^\s*(run|execute|verify|check|test|start)\b/i.test(todos[index])) {
+        writeNow = forcedWrite = true;
+        failures = 0;
+        repeats = 0;
+        seen = new Set();
+        log?.write("stuck", { forceWrite: true });
+        history.note("Stop looking: you have read the code this todo is about. Make the change now: edit the file (or rewrite it) with your best fix.");
         return undefined;
       }
       const go = await this.unstick(index, todos, history, problem);
@@ -506,7 +552,8 @@ export class Agent {
       const compacted = history.compactIfNeeded(historyBudget);
       if (compacted) log?.write("compaction", { turns: compacted });
 
-      const enabled = this.registry.enabled(mode, ctx).filter((t) => !answerNow || t.name === "answer");
+      const forced = (t: ToolDef) => (!answerNow || t.name === "answer") && (!writeNow || MODEL_WRITES.has(t.name));
+      const enabled = this.registry.enabled(mode, ctx).filter(forced);
       // Built exactly like the planner call, so the planner's prefix is reused from the KV cache.
       const messages = mergeConsecutive([...s.prefix, ...history.messages()]);
       const t0 = Date.now();
@@ -556,11 +603,12 @@ export class Agent {
       if (!enabled.some((t) => t.name === action.tool)) {
         const wanted = this.registry.all.find((t) => t.name === action.tool);
         if (wanted?.group && this.unlockGroup(wanted, ctx)) {
-          offered = this.registry.enabled(mode, ctx).filter((t) => !answerNow || t.name === "answer");
+          offered = this.registry.enabled(mode, ctx).filter(forced);
           if (offered.includes(wanted)) log?.write("unlocked", { tool: wanted.name, group: wanted.group });
         }
       }
       const checked = await this.registry.check(action, offered, ctx);
+      if (this.registry.all.find((t) => t.name === action.tool)?.kind === "write") onlyLooking = false;
       if (!checked.ok) {
         if (checked.policy) stats.refusedCalls++;
         else stats.invalidCalls++;
@@ -621,7 +669,7 @@ export class Agent {
         // Checks from rules, else inferred from project files (detected now, so projects created in this run count).
         const checks = changedInTodo || s.checksPending.value ? (s.rules.verifyCommands.length ? s.rules.verifyCommands : await detectChecks(host)) : [];
         if (checks.length) {
-          const failed = await this.verify(checks, emit, (files) => files.forEach((f) => s.changed.add(f)));
+          const failed = await this.verify(checks, emit, (files) => files.forEach((f) => s.changed.add(f)), ctx.seen);
           // Mid-plan, the build may not pass yet: Greeter takes an IClock (todo 1) before SystemClock
           // implements it (todo 2). When the errors are about what a later todo does, check after that one.
           const later = failed ? laterTodoFor(failed, todos.slice(index + 1)) : undefined;
@@ -691,6 +739,8 @@ export class Agent {
         if (tool.kind === "write") {
           stats.editsApplied++;
           appliedWrites.add(key);
+          writeNow = false;
+          onlyLooking = true;
         }
         lastProgress = step;
         // Agent files (.agent/memory.md) don't need the project's build/tests.
@@ -732,6 +782,8 @@ export class Agent {
         if (end) return end;
       }
     }
+    // Out of steps, like stuck: work that passes the checks is done, the model just didn't say so.
+    if (await checksPass(false)) return completeAuto("out of steps, but checks pass");
     return { ok: false, summary: `no result after ${stepLimit} steps` };
   }
 
@@ -832,13 +884,14 @@ export class Agent {
    * Runs verify commands from rules; returns failure text, or undefined when all pass.
    * Missing C# using directives are added by code first (`onChange` gets those files).
    */
-  private async verify(commands: string[], emit: (e: AgentEvent) => void, onChange?: (files: string[]) => void): Promise<string | undefined> {
+  private async verify(commands: string[], emit: (e: AgentEvent) => void, onChange?: (files: string[]) => void, seen?: Iterable<string>): Promise<string | undefined> {
     const { host } = this.deps;
     for (const cmd of commands) {
       let r = await host.runCommand(cmd, undefined, { timeoutMs: 300_000 }); // first build may restore packages
       let fixed = "";
       if (r.exitCode !== 0) {
-        const fix = await missingUsings(r.output, host.root, (p) => host.readFile(p));
+        const read = (p: string) => host.readFile(p);
+        const fix = await missingUsings(r.output, host.root, read, async () => projectTypes(await listFiles(host), read));
         if (fix.changes.length && (await host.proposeWrites(fix.changes, "add missing using directives")).applied) {
           onChange?.(fix.changes.map((c) => c.path));
           fixed = `${fix.note}\n`;
@@ -848,7 +901,8 @@ export class Agent {
       const layout = r.exitCode !== 0 && /\bdotnet\b/.test(cmd) ? nestedProjectProblem(await listFiles(host)) : undefined;
       const body = relativizePaths(r.exitCode === 0 ? r.output : failureReport(r.output, host.root, 80), host.root);
       const where = r.exitCode === 0 ? "" : await errorContext(r.output, host.root, (p) => host.readFile(p));
-      const output = `${fixed}$ ${cmd}\nexit code ${r.exitCode}\n${body}${where}${layout ? `\n\nLikely cause: ${layout}` : ""}`;
+      const hints = r.exitCode !== 0 && seen && parseTestFailures(r.output, host.root).length ? await lintHints(seen, (p) => host.readFile(p)) : "";
+      const output = `${fixed}$ ${cmd}\nexit code ${r.exitCode}\n${body}${where}${hints}${layout ? `\n\nLikely cause: ${layout}` : ""}`;
       emit({ type: "verify", ok: r.exitCode === 0, output });
       if (r.exitCode !== 0) return output;
     }

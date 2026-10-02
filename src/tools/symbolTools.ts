@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { findSymbols } from "../context/mentions";
-import { fileSymbols, identifierOccurrences, languageFor } from "../context/treeSitter";
+import { commentOccurrences, fileSymbols, identifierOccurrences, languageFor } from "../context/treeSitter";
 import type { FileChange, SourcePos } from "../host/types";
 import { IGNORED_DIRS } from "./paths";
 import { findRg, search } from "./search";
@@ -196,6 +196,16 @@ export const renameSymbol: ToolDef<{ symbol: string; new_name: string; path?: st
       }
     }
     if (!changes.length) return fail(`"${name}" was not found in any code file. Check the name with search.`, `rename_symbol ${name}: not found`);
+    // Comments in the renamed files ("// ParseCSV parses ...") name the symbol when the name is code-like
+    // (camelCase, PascalCase with an inner capital, snake_case, digits); a plain word ("Basket") may be prose.
+    let inComments = 0;
+    if (name.length >= 4 && /[a-z][A-Z]|[A-Za-z]_[A-Za-z]|[A-Za-z]\d/.test(name)) {
+      for (const c of changes) {
+        const occs = (await commentOccurrences(c.path, c.content, name)) ?? [];
+        for (const o of [...occs].reverse()) c.content = c.content.slice(0, o.start) + a.new_name + c.content.slice(o.end);
+        inComments += occs.length;
+      }
+    }
     // Renaming onto an existing name would silently merge two symbols.
     for (const c of changes) {
       const before = await ctx.host.readFile(c.path).catch(() => "");
@@ -221,8 +231,9 @@ export const renameSymbol: ToolDef<{ symbol: string; new_name: string; path?: st
     const remaining = left.ok && !left.output.startsWith("No matches")
       ? `\n"${name}" still appears as text (strings, comments or files without a grammar); update these by hand if they should change:\n${left.output.split("\n").slice(0, 15).join("\n")}`
       : "";
+    const comments = inComments ? ` Comments that named it were updated too (${inComments}).` : "";
     return ok(
-      `Renamed ${name} to ${a.new_name} (${via}) in ${changes.length} file(s): ${counts.join(", ")}.${remaining}`,
+      `Renamed ${name} to ${a.new_name} (${via}) in ${changes.length} file(s): ${counts.join(", ")}.${comments}${remaining}`,
       `rename_symbol ${name} → ${a.new_name}: ${changes.length} files`,
       changes.map((c) => c.path),
     );

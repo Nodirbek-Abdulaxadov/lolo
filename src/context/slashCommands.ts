@@ -22,7 +22,31 @@ interface FileCommand extends SlashCommand {
   template: string;
 }
 
+/** Built in; a project command file (`.agent/commands`, `.claude/commands`) with the same name replaces one. Both only read: the answer is the result. */
+const BUILTIN: FileCommand[] = [
+  {
+    name: "review",
+    description: "Review my uncommitted changes for bugs",
+    // Worded as a question ("What ..."), so the message is classified as read-only by code (planner.ts: allowedKinds).
+    template:
+      "What problems do my uncommitted changes have? Read them with git_diff, and the code around them where needed. " +
+      "Answer with the problems you find (bugs, missed cases, broken callers), each with its file and line, most serious first; say so if you find none.\n\n$ARGUMENTS",
+  },
+  {
+    name: "commit-message",
+    description: "Write a commit message for my uncommitted changes",
+    template:
+      "What commit message fits my uncommitted changes? Read them with git_diff. " +
+      "Answer with the message only: a subject line under 72 characters in the imperative, a blank line, then a few lines on what was done and why.\n\n$ARGUMENTS",
+  },
+];
+
 async function fileCommands(host: Host): Promise<FileCommand[]> {
+  const own = await projectCommands(host);
+  return [...own, ...BUILTIN.filter((b) => !own.some((c) => c.name === b.name))];
+}
+
+async function projectCommands(host: Host): Promise<FileCommand[]> {
   const out: FileCommand[] = [];
   for (const dir of COMMAND_DIRS) {
     if ((await host.stat(dir)) !== "dir") continue;
@@ -68,5 +92,5 @@ export async function expandSlashCommand(text: string, host: Host, mcp?: McpHub)
     const skill = (await listSkills(host)).find((s) => s.name.toLowerCase() === name.toLowerCase());
     return skill ? `Use the ${skill.name} skill. ${args.trim()}`.trim() : undefined;
   }
-  return cmd.template.includes("$ARGUMENTS") ? cmd.template.replace(/\$ARGUMENTS/g, args.trim()) : [cmd.template, args.trim()].filter(Boolean).join("\n\n");
+  return (cmd.template.includes("$ARGUMENTS") ? cmd.template.replace(/\$ARGUMENTS/g, args.trim()) : [cmd.template, args.trim()].filter(Boolean).join("\n\n")).trim();
 }
